@@ -14,13 +14,13 @@
 На сервере с нодой, от root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh)
 ```
 
 Если `raw.githubusercontent.com` недоступен с сервера, используйте зеркало:
 
 ```bash
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/SikWeet/weavemarket-cdn-nginx@main/installer.sh)
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/WeaveProduct/weavemarket-cdn-nginx@main/installer.sh)
 ```
 
 Скрипт задаст вопросы:
@@ -64,7 +64,7 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/SikWeet/weavemarket-cdn-nginx@main
 Пример запуска без вопросов:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh) \
   --domain node.example.com --email you@example.com --panel panel.example.com -y
 ```
 
