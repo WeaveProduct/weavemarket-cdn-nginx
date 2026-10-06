@@ -1,39 +1,45 @@
 #!/usr/bin/env bash
-# installer.sh (weavemarket-cdn-nginx) — nginx на 443 (TLS) + сертификат Let's Encrypt + XHTTP для Remnawave Node
+# installer.sh (weavemarket-cdn-nginx) — nginx на 443 (TLS) + сертификат Let's Encrypt + XHTTP + UFW для Remnawave Node
 #
 # Запуск на сервере с нодой, от root:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)
 #
-# Скрипт спросит домен и path для XHTTP, затем:
+# Скрипт спросит домен, path для XHTTP, адрес панели и порт ноды, затем:
 #   1. добавит сервис nginx в /opt/remnanode/docker-compose.yml (остальное не трогает, отступы как в файле)
 #   2. допишет в конец /opt/remnanode/nginx.conf блок для 80 порта и запустит nginx
-#   3. спросит email и выпустит сертификат через certbot (webroot)
-#   4. допишет блок для 443 порта: сайт + проксирование XHTTP на 127.0.0.1:8443
-#   5. включит автопродление сертификатов (с перезагрузкой nginx после продления)
-#   6. создаст заглушку /opt/remnanode/www/index.html
+#   3. настроит UFW: 22 (SSH), 80, 443, порты инбаундов ноды; порт ноды — только для панели
+#   4. спросит email и выпустит сертификат через certbot (webroot)
+#   5. допишет блок для 443 порта: сайт + проксирование XHTTP на 127.0.0.1:8443
+#      (если 443 сейчас держит Xray ноды — остановит ноду на время настройки и запустит обратно)
+#   6. включит автопродление сертификатов (с перезагрузкой nginx после продления)
+#   7. создаст заглушку /opt/remnanode/www/index.html
 #
 # Повторный запуск безопасен: уже добавленное не дублируется, чужие настройки не трогаются.
 # Без вопросов:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh) \
-#     --domain node.example.com --path /api/v1/stream --email you@example.com -y
+#     --domain node.example.com --email you@example.com --panel panel.example.com -y
 
 set -Eeuo pipefail
 
 # ─── Настройки ───────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/remnanode"
-DOMAIN="" XHTTP_PATH="" EMAIL=""
+DOMAIN="" XHTTP_PATH="" EMAIL="" PANEL_ADDR="" NODE_PORT=""
 XHTTP_PORT="8443"
-ASSUME_YES=0
+ASSUME_YES=0 NO_UFW=0
 
 DEFAULT_PATH="/api/v1/stream"
+DEFAULT_NODE_PORT="2222"
 NGINX_IMAGE="nginx:1.30-alpine"
 CONTAINER="remnanode-nginx"
 LE_DIR="/etc/letsencrypt"
 SUPPORT="@WeaveVPN_support"
 MARK="remnanode-setup"
 HTML_MARK="<!-- remnanode-nginx-setup -->"
+INSTALL_CMD="bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)"
 
 TTY="" HAS_IPV6=0 RECREATE=0 SKIP_BLOCKS=0 ADD_DEFAULT=0 ROLLBACK_SIZE=0
+NODE_PROJECT="" NODE_NAMES="" NODE_START_TS="" NODE_BIND_FAIL=0
+NODE_HOLDS=() NODE_STOPPED=() NODE_RESTARTED=() NODE_PUBLIC_PORTS=() PANEL_IPS=() UFW_SUMMARY=()
 
 # ─── Вывод ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -52,15 +58,18 @@ hdr()  { printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }
 trap 'die "Ошибка на строке $LINENO: $BASH_COMMAND"' ERR
 
 usage() {
-  cat <<'EOF'
+  cat <<EOF
 Использование (от root):
-  bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)
+  ${INSTALL_CMD}
   (всё спросит сам)
 
 Параметры (необязательные — чтобы не отвечать на вопросы):
   --domain DOMAIN      домен для настройки и сертификата
-  --path PATH          path для XHTTP (по умолчанию /api/v1/stream)
+  --path PATH          path для XHTTP (по умолчанию ${DEFAULT_PATH})
   --email EMAIL        email для Let's Encrypt
+  --panel ADDR         домен или IP панели — только ей будет открыт порт ноды в UFW
+  --node-port PORT     порт ноды для связи с панелью (по умолчанию из docker-compose.yml, иначе ${DEFAULT_NODE_PORT})
+  --no-ufw             не настраивать UFW
   --xhttp-port PORT    порт XHTTP-инбаунда на 127.0.0.1 (по умолчанию 8443)
   --dir DIR            каталог ноды (по умолчанию /opt/remnanode)
   -y, --yes            не задавать вопросов да/нет (берутся ответы по умолчанию)
@@ -114,6 +123,8 @@ apt_install() {
 is_domain() { local re='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$'; [[ $1 =~ $re ]]; }
 is_email()  { local re='^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'; [[ $1 =~ $re ]]; }
 is_path()   { local re='^/[A-Za-z0-9._~/-]+$'; [[ $1 =~ $re && $1 != *//* ]]; }
+is_ipv4()   { local re='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; [[ $1 =~ $re ]]; }
+is_port()   { [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
 norm_path() {
   local p; p=$(trim "$1")
   [[ $p == /* ]] || p="/$p"
@@ -121,9 +132,22 @@ norm_path() {
   printf '%s' "$p"
 }
 
+# Значение переменной из docker-compose.yml / .env ("- KEY=val", "KEY: val", "KEY=val"); пусто — не нашлось
+extract_var() {
+  local name=$1 f v=""; shift
+  for f in "$@"; do
+    [[ -r $f ]] || continue
+    v=$(sed -nE "/^[[:space:]]*(-[[:space:]]*)?${name}[[:space:]]*[=:]/{s/^[^=:]*[=:][[:space:]]*//;p;q;}" "$f" 2>/dev/null || true)
+    v=$(trim "${v%$'\r'}")
+    v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
+    [[ -z $v ]] || break
+  done
+  printf '%s' "$v"
+}
+
 container_exists()  { docker inspect "$CONTAINER" >/dev/null 2>&1; }
 container_running() { [[ $(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true) == true ]]; }
-container_project() { docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$CONTAINER" 2>/dev/null || true; }
+container_project() { docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "${1:-$CONTAINER}" 2>/dev/null || true; }
 compose_project()   { docker compose -f "$COMPOSE" config 2>/dev/null | sed -n '/^name:/{s/^name:[[:space:]]*//p;q;}' || true; }
 cert_exists()       { [[ -s $LE_DIR/live/$DOMAIN/fullchain.pem && -s $LE_DIR/live/$DOMAIN/privkey.pem ]]; }
 cert_end() {
@@ -132,24 +156,133 @@ cert_end() {
   fi
 }
 
-# Имена процессов на порту, если он занят НЕ нашим nginx. Пусто — свободен (или занят нашим).
-port_foreign_owner() {
-  local port=$1 line pids pid ppid ours="" foreign=0 names
-  line=$(ss -Htlnp "sport = :$port" 2>/dev/null || true)
-  [[ -n $line ]] || return 0
-  if container_running; then ours=$(docker inspect -f '{{.State.Pid}}' "$CONTAINER" 2>/dev/null || true); fi
-  pids=$(grep -o 'pid=[0-9]*' <<<"$line" | cut -d= -f2 | sort -u || true)
-  [[ -n $pids ]] || foreign=1
-  for pid in $pids; do
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-    if [[ -n $ours && ( $pid == "$ours" || $ppid == "$ours" ) ]]; then continue; fi
-    foreign=1
+# ─── Кто держит порт ─────────────────────────────────────────────────────────
+# PID → имя docker-контейнера, в котором работает процесс (пусто — процесс не из контейнера)
+container_of_pid() {
+  local p=$1 anc=" " n=0 cpid name
+  while [[ -n $p && $p != 0 && $p != 1 && $n -lt 40 ]]; do
+    anc+="$p "
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ' || true)
+    n=$((n + 1))
   done
-  if (( foreign )); then
-    names=$(grep -o '"[^"]*"' <<<"$line" | tr -d '"' | sort -u | paste -sd, - || true)
-    printf '%s' "${names:-неизвестный процесс}"
-  fi
+  while read -r cpid name; do
+    if [[ -n $cpid && $cpid != 0 && $anc == *" $cpid "* ]]; then printf '%s' "${name#/}"; return 0; fi
+  done < <(docker ps -q 2>/dev/null | xargs -r docker inspect -f '{{.State.Pid}} {{.Name}}' 2>/dev/null || true)
   return 0
+}
+
+# Контейнер ноды: из того же compose-проекта, что и /opt/remnanode, и это не наш nginx
+is_node_container() {
+  local name=$1 proj
+  [[ -n $name && $name != "$CONTAINER" ]] || return 1
+  [[ $name == remnanode ]] && return 0
+  proj=$(container_project "$name")
+  [[ -n $proj && $proj == "$NODE_PROJECT" ]]
+}
+
+# free | ours | node:<контейнеры> | foreign:<кто>
+port_status() {
+  local port=$1 line pids pid c node="" foreign="" comm
+  line=$(ss -Htlnp "sport = :$port" 2>/dev/null || true)
+  [[ -n $line ]] || { echo free; return 0; }
+  pids=$(grep -o 'pid=[0-9]*' <<<"$line" | cut -d= -f2 | sort -u || true)
+  [[ -n $pids ]] || { echo "foreign:неизвестный процесс"; return 0; }
+  for pid in $pids; do
+    c=$(container_of_pid "$pid")
+    if [[ $c == "$CONTAINER" ]]; then
+      continue
+    elif is_node_container "$c"; then
+      [[ " $node " == *" $c "* ]] || node+=" $c"
+    else
+      comm=$(ps -o comm= -p "$pid" 2>/dev/null || true)
+      foreign+=" ${comm:-pid $pid}${c:+ (контейнер $c)}"
+    fi
+  done
+  if [[ -n $foreign ]]; then echo "foreign:$(trim "$foreign")"
+  elif [[ -n $node ]]; then echo "node:$(trim "$node")"
+  else echo ours; fi
+}
+
+# Публичные порты, которые слушает нода (её инбаунды), — чтобы открыть их в UFW
+collect_node_ports() {
+  local flag proto line addr port pid c
+  for proto in tcp udp; do
+    if [[ $proto == tcp ]]; then flag=-Htlnp; else flag=-Hulnp; fi
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      addr=$(awk '{print $4}' <<<"$line")
+      port=${addr##*:}
+      case $addr in 127.*|\[::1\]:*|::1:*) continue ;; esac
+      case $port in 80|443|"$NODE_PORT"|"$XHTTP_PORT") continue ;; esac
+      pid=$(grep -o 'pid=[0-9]*' <<<"$line" | cut -d= -f2 | sed -n 1p || true)
+      [[ -n $pid ]] || continue
+      c=$(container_of_pid "$pid")
+      is_node_container "$c" || continue
+      [[ " ${NODE_PUBLIC_PORTS[*]-} " == *" $port/$proto "* ]] || NODE_PUBLIC_PORTS+=("$port/$proto")
+    done < <(ss "$flag" 2>/dev/null || true)
+  done
+}
+
+# ─── Остановка / запуск ноды ─────────────────────────────────────────────────
+stop_node() {
+  (( ${#NODE_HOLDS[@]} )) || return 0
+  (( ${#NODE_STOPPED[@]} == 0 )) || return 0
+  local n _ p busy
+  for n in $NODE_NAMES; do
+    log "Останавливаю ноду ($n) — порт ${NODE_HOLDS[*]} нужен nginx"
+    docker stop -t 20 "$n" >/dev/null
+    NODE_STOPPED+=("$n")
+  done
+  for _ in $(seq 1 15); do
+    busy=0
+    for p in "${NODE_HOLDS[@]}"; do
+      case $(port_status "$p") in free|ours) ;; *) busy=1 ;; esac
+    done
+    (( busy )) || return 0
+    sleep 1
+  done
+  die "Нода остановлена, но порт ${NODE_HOLDS[*]} всё ещё занят"
+}
+
+start_node() {
+  (( ${#NODE_STOPPED[@]} )) || return 0
+  local n
+  NODE_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  for n in "${NODE_STOPPED[@]}"; do
+    if docker start "$n" >/dev/null 2>&1; then
+      log "Нода ($n) снова запущена"
+      NODE_RESTARTED+=("$n")
+    else
+      warn "Не смог запустить ноду ($n) — запусти вручную: docker start $n"
+    fi
+  done
+  NODE_STOPPED=()
+}
+
+# После запуска: поднялся ли Xray или упал на занятом порту
+check_node_after_start() {
+  (( ${#NODE_RESTARTED[@]} )) || return 0
+  local _ n logs
+  log "Жду, пока нода получит конфиг от панели (до 30 секунд)…"
+  for _ in $(seq 1 15); do
+    sleep 2
+    for n in "${NODE_RESTARTED[@]}"; do
+      logs=$(docker logs --since "$NODE_START_TS" "$n" 2>&1 || true)
+      if grep -qiE 'address already in use' <<<"$logs"; then NODE_BIND_FAIL=1; return 0; fi
+    done
+  done
+}
+
+# При любом выходе (в том числе по ошибке) — вернуть ноду
+on_exit() {
+  local rc=$?
+  trap - ERR
+  set +e
+  if (( ${#NODE_STOPPED[@]} )); then
+    warn "Возвращаю ноду…"
+    start_node
+  fi
+  exit "$rc"
 }
 
 # ─── docker-compose.yml ──────────────────────────────────────────────────────
@@ -258,9 +391,9 @@ prepare_dirs() {
 
 prepare_container() {
   container_exists || return 0
-  local want have
-  want=$(compose_project); have=$(container_project)
-  if [[ -n $want && $have != "$want" ]]; then
+  local have
+  have=$(container_project)
+  if [[ -n $NODE_PROJECT && $have != "$NODE_PROJECT" ]]; then
     log "Контейнер $CONTAINER создан не из $COMPOSE — пересоздаю"
     docker rm -f "$CONTAINER" >/dev/null
     return 0
@@ -286,6 +419,12 @@ user_conf_has_domain() {
 has_default_443() {
   local re='listen[[:space:]]+([^;[:space:]]*:)?443[^;]*default_server'
   grep -Eq "$re" "$NGINX_CONF"
+}
+
+# Нужен ли nginx порт PORT по текущему nginx.conf
+conf_listens() {
+  [[ $1 == 80 ]] && return 0
+  grep -Eq "^[^#]*listen[[:space:]]+([^;[:space:]]*:)?$1([^0-9]|\$)" "$NGINX_CONF"
 }
 
 gen_http_block() {
@@ -387,10 +526,19 @@ wait_http() {
   return 1
 }
 
+# Освободить для nginx порты, которые держит нода (только те, что nginx реально слушает)
+free_ports_for_nginx() {
+  local p
+  for p in ${NODE_HOLDS[@]+"${NODE_HOLDS[@]}"}; do
+    if conf_listens "$p"; then stop_node; return 0; fi
+  done
+}
+
 # Применить nginx.conf: перечитать работающий nginx или запустить контейнер.
 # nginx_up 1 — при ошибке убрать только что дописанный блок.
 nginx_up() {
   local rb=${1:-0} out extra=()
+  free_ports_for_nginx
   if container_running && (( ! RECREATE )); then
     if ! out=$(docker exec "$CONTAINER" nginx -t 2>&1); then
       printf '%s\n' "$out" | tail -n 5 >&2 || true
@@ -415,6 +563,17 @@ nginx_up() {
   fi
 }
 
+# nginx действительно слушает 443 (а не остался на старом конфиге из-за занятого порта)
+wait_443() {
+  local _
+  for _ in $(seq 1 10); do
+    [[ $(port_status 443) == ours ]] && return 0
+    sleep 1
+  done
+  docker logs --tail 10 "$CONTAINER" >&2 2>&1 || true
+  die "nginx не смог занять 443 порт (лог выше): $(port_status 443)"
+}
+
 selftest_challenge() {
   local token got dir="$WWW_DIR/.well-known/acme-challenge"
   token="selftest-$(rand_hex 8)"
@@ -429,16 +588,19 @@ selftest_challenge() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --domain|--path|--email|--xhttp-port|--dir)
+      --domain|--path|--email|--panel|--node-port|--xhttp-port|--dir)
         [[ $# -ge 2 && -n ${2:-} ]] || die "Параметру $1 нужно значение"
         case $1 in
           --domain)     DOMAIN=$2 ;;
           --path)       XHTTP_PATH=$2 ;;
           --email)      EMAIL=$2 ;;
+          --panel)      PANEL_ADDR=$2 ;;
+          --node-port)  NODE_PORT=$2 ;;
           --xhttp-port) XHTTP_PORT=$2 ;;
           --dir)        INSTALL_DIR=${2%/} ;;
         esac
         shift 2 ;;
+      --no-ufw)  NO_UFW=1; shift ;;
       -y|--yes)  ASSUME_YES=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "Неизвестный параметр: $1 (см. --help)" ;;
@@ -447,10 +609,9 @@ parse_args() {
   COMPOSE="$INSTALL_DIR/docker-compose.yml"
   NGINX_CONF="$INSTALL_DIR/nginx.conf"
   WWW_DIR="$INSTALL_DIR/www"
-  if ! [[ $XHTTP_PORT =~ ^[0-9]{1,5}$ ]] || (( 10#$XHTTP_PORT < 1 || 10#$XHTTP_PORT > 65535 )); then
-    die "Некорректный --xhttp-port: $XHTTP_PORT"
-  fi
+  is_port "$XHTTP_PORT" || die "Некорректный --xhttp-port: $XHTTP_PORT"
   XHTTP_PORT=$(( 10#$XHTTP_PORT ))
+  if [[ -n $NODE_PORT ]]; then is_port "$NODE_PORT" || die "Некорректный --node-port: $NODE_PORT"; fi
 }
 
 preflight() {
@@ -461,6 +622,7 @@ preflight() {
   command -v curl >/dev/null 2>&1 || apt_install curl ca-certificates
   command -v ss   >/dev/null 2>&1 || apt_install iproute2
   if [[ -s /proc/net/if_inet6 ]]; then HAS_IPV6=1; fi
+  NODE_PROJECT=$(compose_project)
 }
 
 ask_domain() {
@@ -493,6 +655,52 @@ ask_email() {
   done
 }
 
+# IP панели по домену или IP. 0 — нашлись.
+resolve_panel() {
+  local a=$1 ip
+  PANEL_IPS=()
+  if is_ipv4 "$a" || [[ $a == *:* ]]; then PANEL_IPS=("$a"); return 0; fi
+  is_domain "$a" || return 1
+  while read -r ip; do
+    [[ -n $ip ]] && PANEL_IPS+=("$ip")
+  done < <(getent ahosts "$a" 2>/dev/null | awk '{print $1}' | sort -u || true)
+  (( ${#PANEL_IPS[@]} ))
+}
+
+ask_ufw() {
+  (( NO_UFW )) && return 0
+  if [[ -z $PANEL_ADDR && -z $TTY ]]; then
+    warn "UFW не настраиваю: не задан адрес панели (--panel)"
+    NO_UFW=1
+    return 0
+  fi
+  local def_port
+  def_port=$(extract_var NODE_PORT "$COMPOSE" "$INSTALL_DIR/.env")
+  is_port "${def_port:-x}" || def_port=$DEFAULT_NODE_PORT
+
+  while :; do
+    ask PANEL_ADDR "Домен или IP панели, которая подключается к ноде (Enter — не настраивать UFW)"
+    PANEL_ADDR=$(trim "${PANEL_ADDR,,}")
+    PANEL_ADDR=${PANEL_ADDR#http://}; PANEL_ADDR=${PANEL_ADDR#https://}; PANEL_ADDR=${PANEL_ADDR%%/*}
+    if [[ -z $PANEL_ADDR ]]; then
+      warn "UFW не настраиваю — адрес панели не указан"
+      NO_UFW=1
+      return 0
+    fi
+    if resolve_panel "$PANEL_ADDR"; then break; fi
+    retry_or_die "Не получилось определить IP панели по '$PANEL_ADDR'"
+    PANEL_ADDR=""
+  done
+  log "Панель: $PANEL_ADDR → ${PANEL_IPS[*]}"
+
+  while :; do
+    ask NODE_PORT "Порт ноды для связи с панелью (NODE_PORT)" "$def_port"
+    if is_port "$NODE_PORT"; then NODE_PORT=$(( 10#$NODE_PORT )); return 0; fi
+    retry_or_die "Некорректный порт: '$NODE_PORT'"
+    NODE_PORT=""
+  done
+}
+
 check_dns() {
   local my_ip dns_ips
   my_ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null \
@@ -510,11 +718,24 @@ check_dns() {
 }
 
 check_ports() {
-  local p who
+  local p st
   for p in 80 443; do
-    who=$(port_foreign_owner "$p")
-    [[ -z $who ]] || die "Порт $p уже занят ($who). nginx нужны свободные 80 и 443"
+    st=$(port_status "$p")
+    case $st in
+      free|ours) ;;
+      node:*)    NODE_HOLDS+=("$p"); NODE_NAMES=${st#node:} ;;
+      foreign:*) die "Порт $p занят: ${st#foreign:}. nginx нужны свободные 80 и 443" ;;
+    esac
   done
+  collect_node_ports
+
+  if (( ${#NODE_HOLDS[@]} )); then
+    warn "Порт ${NODE_HOLDS[*]} сейчас слушает нода ($NODE_NAMES, Xray)."
+    warn "Перед запуском nginx на этом порту ноду остановлю, а в конце запущу обратно."
+    warn "Важно: дальше ${NODE_HOLDS[*]} будет у nginx. Инбаунд на этом порту в профиле ноды перенеси на другой порт"
+    warn "или убери — иначе Xray на ноде не запустится."
+    confirm_yn "Продолжить?" y || die "Остановлено — порт ${NODE_HOLDS[*]} оставлен ноде"
+  fi
 
   # XHTTP-инбаунд должен слушать только 127.0.0.1. Если порт занят снаружи (например, прямым REALITY) —
   # инбаунд на нём не поднимется.
@@ -527,12 +748,41 @@ check_ports() {
   fi
 }
 
-setup_firewall() {
-  command -v ufw >/dev/null 2>&1 || return 0
-  [[ $(ufw status 2>/dev/null || true) == *"Status: active"* ]] || return 0
-  ufw allow 80/tcp  >/dev/null
-  ufw allow 443/tcp >/dev/null
-  log "ufw: открыл порты 80 и 443"
+setup_ufw() {
+  if (( NO_UFW )); then return 0; fi
+  command -v ufw >/dev/null 2>&1 || apt_install ufw
+  local was_active=0 p ip ssh_ports=""
+  if [[ $(ufw status 2>/dev/null || true) == *"Status: active"* ]]; then was_active=1; fi
+
+  # SSH: 22 всегда + порты, на которых реально слушает sshd (если он перенесён)
+  ssh_ports=$(ss -Htlnp 2>/dev/null | grep '"sshd"' | awk '{print $4}' | sed 's/.*://' | sort -un | paste -sd' ' - || true)
+  for p in 22 $ssh_ports; do ufw allow "$p/tcp" comment 'SSH' >/dev/null; done
+  UFW_SUMMARY+=("SSH: $(printf '%s\n' 22 $ssh_ports | sort -un | paste -sd, -)")
+
+  ufw allow 80/tcp comment 'HTTP (certbot)' >/dev/null
+  ufw allow 443/tcp comment 'HTTPS (nginx)' >/dev/null
+  UFW_SUMMARY+=("80, 443: для всех")
+
+  for p in ${NODE_PUBLIC_PORTS[@]+"${NODE_PUBLIC_PORTS[@]}"}; do
+    ufw allow "$p" comment 'Remnawave inbound' >/dev/null
+  done
+  if (( ${#NODE_PUBLIC_PORTS[@]} )); then UFW_SUMMARY+=("инбаунды ноды: ${NODE_PUBLIC_PORTS[*]}"); fi
+
+  # Порт ноды — только для панели: убираем правила «открыт всем», если были
+  ufw delete allow "$NODE_PORT/tcp" >/dev/null 2>&1 || true
+  ufw delete allow "$NODE_PORT" >/dev/null 2>&1 || true
+  for ip in "${PANEL_IPS[@]}"; do
+    ufw allow from "$ip" to any port "$NODE_PORT" proto tcp comment 'Remnawave panel' >/dev/null
+  done
+  UFW_SUMMARY+=("$NODE_PORT: только для панели ($PANEL_ADDR → ${PANEL_IPS[*]})")
+
+  if (( ! was_active )); then
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+  fi
+  ufw --force enable >/dev/null
+  log "UFW включён:"
+  for p in "${UFW_SUMMARY[@]}"; do echo "    - $p"; done
 }
 
 issue_cert() {
@@ -558,7 +808,7 @@ setup_renewal() {
   mkdir -p "$(dirname "$hook")"
   cat >"$hook" <<EOF
 #!/bin/sh
-# remnanode-nginx-setup.sh: перечитать nginx после продления сертификата
+# remnanode-nginx-setup: перечитать nginx после продления сертификата
 docker exec ${CONTAINER} nginx -s reload >/dev/null 2>&1 || true
 EOF
   chmod 755 "$hook"
@@ -575,7 +825,7 @@ EOF
     log "Автопродление: systemd-таймер certbot.timer (2 раза в день)"
   else
     command -v cron >/dev/null 2>&1 || apt_install cron
-    printf '%s\n' "# remnanode-nginx-setup.sh: автопродление сертификатов" \
+    printf '%s\n' "# remnanode-nginx-setup: автопродление сертификатов" \
       "17 3,15 * * * root certbot -q renew" >/etc/cron.d/remnanode-certbot
     chmod 644 /etc/cron.d/remnanode-certbot
     log "Автопродление: cron (/etc/cron.d/remnanode-certbot, 2 раза в день)"
@@ -679,13 +929,31 @@ make_index() {
 }
 
 finish() {
-  local code
+  local code s
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
          --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" 2>/dev/null || true)
 
   hdr "Для панели Remnawave"
   echo "  Инбаунд:  VLESS, xhttp, security none, listen 127.0.0.1, port $XHTTP_PORT, path $XHTTP_PATH"
   echo "  Хост:     адрес $DOMAIN, порт 443, TLS, SNI $DOMAIN, XHTTP mode packet-up"
+  if (( ! NO_UFW )); then
+    echo "  UFW:"
+    for s in "${UFW_SUMMARY[@]}"; do echo "    - $s"; done
+    echo "    Новый инбаунд на публичном порту — открой его: ufw allow <порт>"
+  fi
+
+  if (( ${#NODE_HOLDS[@]} )); then
+    echo
+    if (( NODE_BIND_FAIL )); then
+      warn "Xray на ноде НЕ запустился: порт ${NODE_HOLDS[*]} теперь у nginx."
+      warn "В панели перенеси инбаунд с ${NODE_HOLDS[*]} на другой порт (и открой его: ufw allow <порт>)"
+      warn "или назначь ноде профиль, где на ${NODE_HOLDS[*]} ничего нет. Пока это не сделано — нода offline."
+    else
+      warn "Порт ${NODE_HOLDS[*]} теперь у nginx. Если в профиле ноды остался инбаунд на ${NODE_HOLDS[*]} — перенеси его,"
+      warn "иначе Xray не запустится. Проверь в панели, что нода Online."
+    fi
+  fi
+
   echo
   if [[ $code == 200 ]]; then
     printf '%s✅ Всё готово!%s\n' "$C_G" "$C_0"
@@ -699,10 +967,12 @@ finish() {
 main() {
   parse_args "$@"
   init_tty
-  hdr "Remnawave Node: nginx + сертификат + XHTTP"
+  trap on_exit EXIT
+  hdr "Remnawave Node: nginx + сертификат + XHTTP + UFW"
   preflight
   ask_domain
   ask_path
+  ask_ufw
   check_dns
   check_ports
 
@@ -724,7 +994,9 @@ main() {
     nginx_up 0
     log "Блок 80 порта для $DOMAIN уже есть в $NGINX_CONF"
   fi
-  setup_firewall
+
+  hdr "UFW"
+  if (( NO_UFW )); then log "Пропускаю"; else setup_ufw; fi
 
   hdr "Сертификат"
   issue_cert
@@ -742,12 +1014,19 @@ main() {
   else
     nginx_up 0
   fi
+  if conf_listens 443; then wait_443; fi
 
   hdr "Автопродление"
   setup_renewal
 
   hdr "Заглушка"
   make_index
+
+  if (( ${#NODE_STOPPED[@]} )); then
+    hdr "Нода"
+    start_node
+    check_node_after_start
+  fi
 
   finish
 }
