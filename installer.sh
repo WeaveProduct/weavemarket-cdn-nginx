@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# remnanode-nginx-setup.sh — nginx на 443 (TLS) + сертификат Let's Encrypt + XHTTP для Remnawave Node
+# installer.sh (weavemarket-cdn-nginx) — nginx на 443 (TLS) + сертификат Let's Encrypt + XHTTP для Remnawave Node
 #
 # Запуск на сервере с нодой, от root:
-#   bash remnanode-nginx-setup.sh
+#   bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)
 #
 # Скрипт спросит домен и path для XHTTP, затем:
 #   1. добавит сервис nginx в /opt/remnanode/docker-compose.yml (остальное не трогает, отступы как в файле)
@@ -14,7 +14,8 @@
 #
 # Повторный запуск безопасен: уже добавленное не дублируется, чужие настройки не трогаются.
 # Без вопросов:
-#   bash remnanode-nginx-setup.sh --domain node.example.com --path /api/v1/stream --email you@example.com -y
+#   bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh) \
+#     --domain node.example.com --path /api/v1/stream --email you@example.com -y
 
 set -Eeuo pipefail
 
@@ -53,7 +54,8 @@ trap 'die "Ошибка на строке $LINENO: $BASH_COMMAND"' ERR
 usage() {
   cat <<'EOF'
 Использование (от root):
-  bash remnanode-nginx-setup.sh                 — всё спросит сам
+  bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)
+  (всё спросит сам)
 
 Параметры (необязательные — чтобы не отвечать на вопросы):
   --domain DOMAIN      домен для настройки и сертификата
@@ -452,7 +454,7 @@ parse_args() {
 }
 
 preflight() {
-  (( EUID == 0 )) || die "Запусти от root: sudo bash remnanode-nginx-setup.sh"
+  (( EUID == 0 )) || die "Нужны права root: выполни «sudo -i» и запусти команду установки ещё раз"
   [[ -f $COMPOSE ]] || die "Не найден $COMPOSE — сначала установи Remnawave Node: https://docs.rw/install/remnawave-node"
   command -v docker >/dev/null 2>&1 || die "Не найден docker — сначала установи Remnawave Node: https://docs.rw/install/remnawave-node"
   docker compose version >/dev/null 2>&1 || die "Не найден docker compose (пакет docker-compose-plugin)"
