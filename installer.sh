@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# installer.sh (weavemarket-cdn-nginx) — nginx на 443 (TLS) + сертификат Let's Encrypt + XHTTP + UFW для Remnawave Node
+# installer.sh (weavemarket-cdn-nginx) — nginx за REALITY (unix-сокет) + сертификат Let's Encrypt + XHTTP + UFW
+# для Remnawave Node
 #
 # Запуск на сервере с нодой, от root:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh)
 #
+# Схема: 443 держит Xray (REALITY). Всё, что не прошло авторизацию REALITY (браузеры, сканеры, CDN),
+# Xray отдаёт в nginx через unix:/dev/shm/nginx.sock (PROXY protocol). nginx показывает сайт-заглушку
+# с настоящим сертификатом и проксирует XHTTP-path на инбаунд Xray 127.0.0.1:8443.
+#
 # Скрипт спросит домен, path для XHTTP, адрес панели и порт ноды, затем:
-#   1. добавит сервис nginx в /opt/remnanode/docker-compose.yml (остальное не трогает, отступы как в файле)
+#   1. добавит сервис nginx в /opt/remnanode/docker-compose.yml, а ноде — общий /dev/shm
+#      (остальное не трогает, отступы как в файле)
 #   2. допишет в конец /opt/remnanode/nginx.conf блок для 80 порта и запустит nginx
 #   3. настроит UFW: 22 (SSH), 80, 443, порты инбаундов ноды; порт ноды — только для панели
 #   4. спросит email и выпустит сертификат через certbot (webroot)
-#   5. допишет блок для 443 порта: сайт + проксирование XHTTP на 127.0.0.1:8443
-#      (если 443 сейчас держит Xray ноды — остановит ноду на время настройки и запустит обратно)
+#   5. допишет блок для сокета: listen unix:/dev/shm/nginx.sock ssl proxy_protocol + http2
 #   6. включит автопродление сертификатов (с перезагрузкой nginx после продления)
 #   7. создаст заглушку /opt/remnanode/www/index.html
+#   8. перезапустит ноду, если ей добавлялся /dev/shm, и покажет инбаунды для панели
 #
 # Повторный запуск безопасен: уже добавленное не дублируется, чужие настройки не трогаются.
 # Без вопросов:
@@ -31,6 +37,8 @@ DEFAULT_PATH="/api/v1/stream"
 DEFAULT_NODE_PORT="2222"
 NGINX_IMAGE="nginx:1.30-alpine"
 CONTAINER="remnanode-nginx"
+SOCK="/dev/shm/nginx.sock"
+SHM_MOUNT="/dev/shm:/dev/shm"
 LE_DIR="/etc/letsencrypt"
 SUPPORT="@WeaveVPN_support"
 MARK="remnanode-setup"
@@ -38,8 +46,8 @@ HTML_MARK="<!-- remnanode-nginx-setup -->"
 INSTALL_CMD="bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh)"
 
 TTY="" HAS_IPV6=0 RECREATE=0 SKIP_BLOCKS=0 ADD_DEFAULT=0 ROLLBACK_SIZE=0
-NODE_PROJECT="" NODE_NAMES="" NODE_START_TS="" NODE_BIND_FAIL=0
-NODE_HOLDS=() NODE_STOPPED=() NODE_RESTARTED=() NODE_PUBLIC_PORTS=() PANEL_IPS=() UFW_SUMMARY=()
+NODE_PROJECT="" NODE_SVC="" NODE_NEEDS_SHM=0 NODE_KICK=0 NODE_RECREATED=0 COMPOSE_BAK=""
+NODE_PUBLIC_PORTS=() PANEL_IPS=() UFW_SUMMARY=()
 
 # ─── Вывод ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -181,6 +189,7 @@ cert_end() {
     openssl x509 -enddate -noout -in "$LE_DIR/live/$DOMAIN/fullchain.pem" 2>/dev/null | cut -d= -f2 || true
   fi
 }
+sock_listening() { [[ $(ss -Hxl 2>/dev/null || true) == *"$SOCK"* ]]; }
 
 # ─── Кто держит порт ─────────────────────────────────────────────────────────
 # PID → имя docker-контейнера, в котором работает процесс (пусто — процесс не из контейнера)
@@ -249,68 +258,6 @@ collect_node_ports() {
   done
 }
 
-# ─── Остановка / запуск ноды ─────────────────────────────────────────────────
-stop_node() {
-  (( ${#NODE_HOLDS[@]} )) || return 0
-  (( ${#NODE_STOPPED[@]} == 0 )) || return 0
-  local n _ p busy
-  for n in $NODE_NAMES; do
-    log "Останавливаю ноду ($n) — порт ${NODE_HOLDS[*]} нужен nginx"
-    docker stop -t 20 "$n" >/dev/null
-    NODE_STOPPED+=("$n")
-  done
-  for _ in $(seq 1 15); do
-    busy=0
-    for p in "${NODE_HOLDS[@]}"; do
-      case $(port_status "$p") in free|ours) ;; *) busy=1 ;; esac
-    done
-    (( busy )) || return 0
-    sleep 1
-  done
-  die "Нода остановлена, но порт ${NODE_HOLDS[*]} всё ещё занят"
-}
-
-start_node() {
-  (( ${#NODE_STOPPED[@]} )) || return 0
-  local n
-  NODE_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  for n in "${NODE_STOPPED[@]}"; do
-    if docker start "$n" >/dev/null 2>&1; then
-      log "Нода ($n) снова запущена"
-      NODE_RESTARTED+=("$n")
-    else
-      warn "Не смог запустить ноду ($n) — запусти вручную: docker start $n"
-    fi
-  done
-  NODE_STOPPED=()
-}
-
-# После запуска: поднялся ли Xray или упал на занятом порту
-check_node_after_start() {
-  (( ${#NODE_RESTARTED[@]} )) || return 0
-  local _ n logs
-  log "Жду, пока нода получит конфиг от панели (до 30 секунд)…"
-  for _ in $(seq 1 15); do
-    sleep 2
-    for n in "${NODE_RESTARTED[@]}"; do
-      logs=$(docker logs --since "$NODE_START_TS" "$n" 2>&1 || true)
-      if grep -qiE 'address already in use' <<<"$logs"; then NODE_BIND_FAIL=1; return 0; fi
-    done
-  done
-}
-
-# При любом выходе (в том числе по ошибке) — вернуть ноду
-on_exit() {
-  local rc=$?
-  trap - ERR
-  set +e
-  if (( ${#NODE_STOPPED[@]} )); then
-    warn "Возвращаю ноду…"
-    start_node
-  fi
-  exit "$rc"
-}
-
 # ─── docker-compose.yml ──────────────────────────────────────────────────────
 # Отступы в compose: "S U L HAS_NGINX FOUND"
 #   S — отступ имён сервисов, U — шаг до их ключей, L — отступ элементов списка от ключа
@@ -326,7 +273,7 @@ compose_layout() {
       item = ($0 ~ /^ *-( |$)/)
       if (S < 0) S = ind
       if (ind == S && !item) {
-        k = $0; sub(/^ +/, "", k); sub(/[ \t]*:.*$/, "", k); gsub(/["\047]/, "", k)
+        k = $0; sub(/^ +/, "", k); sub(/[ \t]*:.*$/, "", k); gsub(/"/, "", k)
         if (k == "nginx") nginx = 1
         lastkey = ind; next
       }
@@ -342,6 +289,112 @@ compose_layout() {
   ' "$1"
 }
 
+# Имя сервиса в compose по container_name (CN) или по образу (IMG, подстрока)
+compose_find_service() { # CN IMG
+  awk -v cn="$1" -v img="$2" -v q="'" '
+    function ind(s) { match(s, /^ */); return RLENGTH }
+    /^[^ \t#]/ { insvc = ($0 ~ /^services:[ \t]*(#.*)?$/); next }
+    !insvc     { next }
+    /^[ \t]*$/ { next }
+    /^[ \t]*#/ { next }
+    {
+      d = ind($0)
+      if (S == "") S = d
+      if (d == S) { k = $0; sub(/^ +/, "", k); sub(/[ \t]*:.*$/, "", k); gsub(/"/, "", k); cur = k; next }
+      if (found != "" || cur == "") next
+      v = $0; sub(/^[ \t]*/, "", v)
+      if (cn != "" && v ~ /^container_name:/) {
+        sub(/^container_name:[ \t]*/, "", v); sub(/[ \t]*(#.*)?$/, "", v); gsub("[\"" q "]", "", v)
+        if (v == cn) found = cur
+      }
+      if (img != "" && v ~ /^image:/) {
+        sub(/^image:[ \t]*/, "", v); gsub("[\"" q "]", "", v)
+        if (index(v, img)) found = cur
+      }
+    }
+    END { print found }
+  ' "$COMPOSE"
+}
+
+# Добавить элемент в volumes сервиса SVC (с отступами как в файле). Результат — в OUT.
+# Код возврата: 0 — добавлено, 3 — уже есть, 2 — сервис не найден.
+compose_edit_volume() { # SVC ITEM OUT
+  local l
+  read -r _ _ l _ _ < <(compose_layout "$COMPOSE")
+  awk -v svc="$1" -v item="$2" -v L="$l" '
+    function ind(s) { match(s, /^ */); return RLENGTH }
+    function sp(n,   r) { r = ""; while (n-- > 0) r = r " "; return r }
+    function blank(s) { return (s ~ /^[ \t]*$/ || s ~ /^[ \t]*#/) }
+    { line[NR] = $0 }
+    END {
+      n = NR; S = -1; start = 0; stop = 0; insvc = 0
+      for (i = 1; i <= n; i++) {
+        s = line[i]
+        if (s ~ /^[^ \t#]/) { if (start && !stop) stop = i - 1; insvc = (s ~ /^services:[ \t]*(#.*)?$/); continue }
+        if (!insvc || blank(s)) continue
+        d = ind(s)
+        if (S < 0) S = d
+        if (d == S) {
+          if (start && !stop) stop = i - 1
+          k = s; sub(/^ +/, "", k); sub(/[ \t]*:.*$/, "", k); gsub(/"/, "", k)
+          if (k == svc && !start) start = i
+        }
+      }
+      if (!start) exit 2
+      if (!stop) stop = n
+      while (stop > start && blank(line[stop])) stop--
+      for (i = start; i <= stop; i++) if (line[i] ~ /^[ \t]*-[ \t]/ && index(line[i], item)) exit 3
+      K = -1
+      for (i = start + 1; i <= stop; i++) if (!blank(line[i])) { K = ind(line[i]); break }
+      if (K < 0) K = S + 2
+      vl = 0
+      for (i = start + 1; i <= stop; i++)
+        if (!blank(line[i]) && ind(line[i]) == K && line[i] ~ /^ *volumes:[ \t]*(#.*)?$/) { vl = i; break }
+      if (vl) {
+        II = -1; ins = vl
+        for (i = vl + 1; i <= stop; i++) {
+          if (blank(line[i])) continue
+          if (line[i] !~ /^ *-/ && ind(line[i]) <= K) break
+          if (II < 0 && line[i] ~ /^ *-/) II = ind(line[i])
+          ins = i
+        }
+        if (II < 0) II = K + L
+        text = sp(II) "- " item
+      } else {
+        ins = stop
+        text = sp(K) "volumes:\n" sp(K + L) "- " item
+      }
+      for (i = 1; i <= n; i++) { print line[i]; if (i == ins) print text }
+    }
+  ' "$COMPOSE" >"$3"
+}
+
+compose_backup_once() {
+  [[ -n $COMPOSE_BAK ]] && return 0
+  COMPOSE_BAK="$COMPOSE.bak-$(stamp)"
+  cp -a "$COMPOSE" "$COMPOSE_BAK"
+}
+
+compose_validate_or_restore() { # что меняли
+  if ! docker compose -f "$COMPOSE" config -q >/dev/null 2>&1; then
+    cat "$COMPOSE_BAK" >"$COMPOSE"
+    die "После изменения ($1) файл $COMPOSE перестал проходить проверку — вернул как было"
+  fi
+}
+
+# Добавить /dev/shm в volumes сервиса. 0 — добавлен сейчас, 1 — уже был.
+compose_add_shm() { # SVC
+  local tmp rc=0
+  tmp=$(mktemp)
+  compose_edit_volume "$1" "$SHM_MOUNT" "$tmp" || rc=$?
+  case $rc in
+    0) compose_backup_once; cat "$tmp" >"$COMPOSE"; rm -f "$tmp"
+       compose_validate_or_restore "/dev/shm для $1"; return 0 ;;
+    3) rm -f "$tmp"; return 1 ;;
+    *) rm -f "$tmp"; die "Не нашёл сервис $1 в $COMPOSE" ;;
+  esac
+}
+
 gen_compose_block() { # S U L
   local s k i
   s=$(printf '%*s' "$1" '')
@@ -353,10 +406,12 @@ ${k}image: ${NGINX_IMAGE}
 ${k}container_name: ${CONTAINER}
 ${k}restart: always
 ${k}network_mode: host
+${k}command: ["/bin/sh", "-c", "rm -f ${SOCK}; exec nginx -g 'daemon off;'"]
 ${k}volumes:
 ${i}- ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
 ${i}- ${LE_DIR}:${LE_DIR}:ro
 ${i}- ./www:/var/www/html:ro
+${i}- ${SHM_MOUNT}
 EOF
 }
 
@@ -376,29 +431,36 @@ compose_insert() { # FILE BLOCKFILE
 }
 
 compose_add_nginx() {
-  local re="^[[:space:]]*container_name:[[:space:]]*[\"']?${CONTAINER}[\"']?[[:space:]]*(#.*)?\$"
-  if grep -Eq "$re" "$COMPOSE"; then
-    log "Сервис nginx уже есть в $COMPOSE — не трогаю"
+  local svc s u l has_nginx found blockf tmp
+  svc=$(compose_find_service "$CONTAINER" "")
+  if [[ -n $svc ]]; then
+    if compose_add_shm "$svc"; then
+      log "Добавил $SHM_MOUNT в сервис $svc (nginx)"
+      RECREATE=1
+    else
+      log "Сервис nginx уже есть в $COMPOSE"
+    fi
     return 0
   fi
-  local s u l has_nginx found blockf tmp bak
   read -r s u l has_nginx found < <(compose_layout "$COMPOSE")
   [[ $found == 1 ]] || die "В $COMPOSE не нашёл секцию services:"
   [[ $has_nginx == 0 ]] || die "В $COMPOSE уже есть другой сервис с именем nginx — переименуй его и запусти скрипт снова"
 
   blockf=$(mktemp); tmp=$(mktemp)
   gen_compose_block "$s" "$u" "$l" >"$blockf"
-  bak="$COMPOSE.bak-$(stamp)"
-  cp -a "$COMPOSE" "$bak"
+  compose_backup_once
   compose_insert "$COMPOSE" "$blockf" >"$tmp"
   cat "$tmp" >"$COMPOSE"
   rm -f "$tmp" "$blockf"
+  compose_validate_or_restore "сервис nginx"
+  log "Добавил сервис nginx в $COMPOSE (копия старого: $COMPOSE_BAK)"
+}
 
-  if ! docker compose -f "$COMPOSE" config -q >/dev/null 2>&1; then
-    cat "$bak" >"$COMPOSE"
-    die "После добавления nginx файл $COMPOSE перестал проходить проверку — вернул как было"
+compose_node_shm() {
+  [[ -n $NODE_SVC ]] || return 0
+  if compose_add_shm "$NODE_SVC"; then
+    log "Добавил $SHM_MOUNT в сервис ноды ($NODE_SVC) — нода перезапустится в конце"
   fi
-  log "Добавил сервис nginx в $COMPOSE (копия старого: $bak)"
 }
 
 # ─── nginx.conf ──────────────────────────────────────────────────────────────
@@ -442,15 +504,14 @@ user_conf_has_domain() {
   grep -Eq "$re" <<<"$stripped"
 }
 
-has_default_443() {
-  local re='listen[[:space:]]+([^;[:space:]]*:)?443[^;]*default_server'
+has_default_sock() {
+  local re="^[^#]*listen[[:space:]]+unix:${SOCK//./\\.}[^;]*default_server"
   grep -Eq "$re" "$NGINX_CONF"
 }
 
-# Нужен ли nginx порт PORT по текущему nginx.conf
-conf_listens() {
-  [[ $1 == 80 ]] && return 0
-  grep -Eq "^[^#]*listen[[:space:]]+([^;[:space:]]*:)?$1([^0-9]|\$)" "$NGINX_CONF"
+# Строки nginx.conf, где nginx слушает 443 (они отберут порт у Xray)
+conf_443_lines() {
+  grep -nE '^[^#]*listen[[:space:]]+([^;[:space:]]*:)?443([^0-9]|$)' "$NGINX_CONF" | cut -d: -f1 | paste -sd, - || true
 }
 
 gen_http_block() {
@@ -472,29 +533,31 @@ EOF
 }
 
 gen_default_block() {
-  local v6=""
-  if (( HAS_IPV6 )); then v6=$'\n    listen [::]:443 ssl default_server;'; fi
   cat <<EOF
 
-# Запросы не на наши домены (сканеры по IP и т.п.) — обрываем на TLS-рукопожатии
+# Запросы не на наши домены (сканеры с чужим SNI и т.п.) — обрываем на TLS-рукопожатии
 server {
-    listen 443 ssl default_server;${v6}
+    listen unix:${SOCK} ssl proxy_protocol default_server;
     server_name _;
     ssl_reject_handshake on;
 }
 EOF
 }
 
-gen_https_block() {
-  local v6="" def=""
-  if (( HAS_IPV6 )); then v6=$'\n    listen [::]:443 ssl;'; fi
+gen_sock_block() {
+  local def=""
   if (( ADD_DEFAULT )); then def=$(gen_default_block); fi
   cat <<EOF
-# >>> ${MARK} https ${DOMAIN}
+# >>> ${MARK} sock ${DOMAIN}
+# Сюда приходит всё, что Xray (REALITY на 443) не авторизовал: target = ${SOCK}, xver = 1
 server {
-    listen 443 ssl;${v6}
+    listen unix:${SOCK} ssl proxy_protocol;
     http2 on;
     server_name ${DOMAIN};
+
+    # настоящий IP клиента приходит от Xray по PROXY protocol
+    set_real_ip_from unix:;
+    real_ip_header proxy_protocol;
 
     ssl_certificate     ${LE_DIR}/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key ${LE_DIR}/live/${DOMAIN}/privkey.pem;
@@ -514,8 +577,8 @@ server {
         proxy_pass http://127.0.0.1:${XHTTP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Real-IP \$proxy_protocol_addr;
+        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 900s;
@@ -523,7 +586,7 @@ server {
         client_max_body_size 0;
     }
 }${def}
-# <<< ${MARK} https ${DOMAIN}
+# <<< ${MARK} sock ${DOMAIN}
 EOF
 }
 
@@ -540,6 +603,24 @@ append_block() { # KIND GENERATOR
   return 0
 }
 
+# Убрать наш блок KIND для домена (cat > сохраняет файл, смонтированный в контейнер). 0 — убрал.
+remove_block() { # KIND
+  local kind=$1 tmp
+  grep -Fqx "# >>> $MARK $kind $DOMAIN" "$NGINX_CONF" || return 1
+  tmp=$(mktemp)
+  awk -v b="# >>> $MARK $kind $DOMAIN" -v e="# <<< $MARK $kind $DOMAIN" '
+    $0 == b { held = 0; skip = 1; next }
+    skip    { if ($0 == e) skip = 0; next }
+    { if (held) { print ""; held = 0 } }
+    /^[ \t]*$/ { held = 1; next }
+    { print }
+    END { if (held) print "" }
+  ' "$NGINX_CONF" >"$tmp"
+  cat "$tmp" >"$NGINX_CONF"
+  rm -f "$tmp"
+  return 0
+}
+
 # Убрать только что дописанный блок (truncate сохраняет файл, который смонтирован в контейнер)
 rollback() { truncate -s "$ROLLBACK_SIZE" "$NGINX_CONF"; }
 
@@ -552,19 +633,15 @@ wait_http() {
   return 1
 }
 
-# Освободить для nginx порты, которые держит нода (только те, что nginx реально слушает)
-free_ports_for_nginx() {
-  local p
-  for p in ${NODE_HOLDS[@]+"${NODE_HOLDS[@]}"}; do
-    if conf_listens "$p"; then stop_node; return 0; fi
-  done
+# Сокет остался от упавшего nginx — иначе новый не сможет его занять
+clear_stale_sock() {
+  if [[ -S $SOCK ]] && ! sock_listening; then rm -f "$SOCK"; fi
 }
 
-# Применить nginx.conf: перечитать работающий nginx или запустить контейнер.
+# Применить nginx.conf: перечитать работающий nginx или (пере)создать контейнер.
 # nginx_up 1 — при ошибке убрать только что дописанный блок.
 nginx_up() {
   local rb=${1:-0} out extra=()
-  free_ports_for_nginx
   if container_running && (( ! RECREATE )); then
     if ! out=$(docker exec "$CONTAINER" nginx -t 2>&1); then
       printf '%s\n' "$out" | tail -n 5 >&2 || true
@@ -574,6 +651,7 @@ nginx_up() {
     docker exec "$CONTAINER" nginx -s reload >/dev/null 2>&1 || true
     sleep 1
   else
+    clear_stale_sock
     if (( RECREATE )); then extra=(--force-recreate); fi
     if ! out=$(docker compose -f "$COMPOSE" up -d ${extra[@]+"${extra[@]}"} nginx 2>&1); then
       printf '%s\n' "$out" >&2
@@ -584,20 +662,31 @@ nginx_up() {
   fi
   if ! wait_http; then
     docker logs --tail 15 "$CONTAINER" >&2 2>&1 || true
-    if (( rb )); then rollback; die "nginx не поднялся на 80 порту (лог выше) — новый блок убрал из $NGINX_CONF"; fi
+    if (( rb )); then rollback; die "nginx не поднялся (лог выше) — новый блок убрал из $NGINX_CONF"; fi
     die "nginx не поднялся на 80 порту (лог выше)"
   fi
 }
 
-# nginx действительно слушает 443 (а не остался на старом конфиге из-за занятого порта)
-wait_443() {
+wait_sock() {
   local _
   for _ in $(seq 1 10); do
-    [[ $(port_status 443) == ours ]] && return 0
+    sock_listening && return 0
     sleep 1
   done
   docker logs --tail 10 "$CONTAINER" >&2 2>&1 || true
-  die "nginx не смог занять 443 порт (лог выше): $(port_status 443)"
+  die "nginx не создал сокет $SOCK (лог выше)"
+}
+
+# Код ответа сайта через сокет — так, как его увидит Xray
+sock_http_code() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 5 --unix-socket "$SOCK" --haproxy-protocol \
+    "https://$DOMAIN/" 2>/dev/null || true
+}
+
+# Код ответа через 443 (через REALITY → сокет), если 443 слушает нода
+tls_443_code() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" \
+    "https://$DOMAIN/" 2>/dev/null || true
 }
 
 selftest_challenge() {
@@ -635,6 +724,7 @@ parse_args() {
   COMPOSE="$INSTALL_DIR/docker-compose.yml"
   NGINX_CONF="$INSTALL_DIR/nginx.conf"
   WWW_DIR="$INSTALL_DIR/www"
+  INBOUNDS_JSON="$INSTALL_DIR/remnawave-inbounds.json"
   is_port "$XHTTP_PORT" || die "Некорректный --xhttp-port: $XHTTP_PORT"
   XHTTP_PORT=$(( 10#$XHTTP_PORT ))
   if [[ -n $NODE_PORT ]]; then is_port "$NODE_PORT" || die "Некорректный --node-port: $NODE_PORT"; fi
@@ -649,6 +739,11 @@ preflight() {
   command -v ss   >/dev/null 2>&1 || apt_install iproute2
   if [[ -s /proc/net/if_inet6 ]]; then HAS_IPV6=1; fi
   NODE_PROJECT=$(compose_project)
+  NODE_SVC=$(compose_find_service remnanode remnawave/node)
+  [[ -n $NODE_SVC ]] || die "В $COMPOSE не нашёл сервис ноды (container_name remnanode или образ remnawave/node)"
+  local rc=0
+  compose_edit_volume "$NODE_SVC" "$SHM_MOUNT" /dev/null || rc=$?
+  if (( rc == 0 )); then NODE_NEEDS_SHM=1; fi
 }
 
 ask_domain() {
@@ -744,33 +839,35 @@ check_dns() {
 }
 
 check_ports() {
-  local p st
-  for p in 80 443; do
-    st=$(port_status "$p")
-    case $st in
-      free|ours) ;;
-      node:*)    NODE_HOLDS+=("$p"); NODE_NAMES=${st#node:} ;;
-      foreign:*) die "Порт $p занят: ${st#foreign:}. nginx нужны свободные 80 и 443" ;;
-    esac
-  done
+  local st
+  st=$(port_status 80)
+  case $st in
+    free|ours) ;;
+    node:*)    die "Порт 80 занят нодой (${st#node:}) — перенеси инбаунд с 80 на другой порт. nginx нужен 80 для сертификата" ;;
+    foreign:*) die "Порт 80 занят: ${st#foreign:}. nginx нужен свободный 80 для сертификата" ;;
+  esac
+
+  st=$(port_status 443)
+  case $st in
+    foreign:*) warn "443 сейчас занят: ${st#foreign:}. По этой схеме 443 должен держать Xray (REALITY) — освободи порт." ;;
+    ours)      log "443 сейчас держит nginx (старая схема) — переведу его на сокет и отдам 443 Xray"
+               NODE_KICK=1 ;;
+  esac
   collect_node_ports
 
-  if (( ${#NODE_HOLDS[@]} )); then
-    warn "Порт ${NODE_HOLDS[*]} сейчас слушает нода ($NODE_NAMES, Xray)."
-    warn "Перед запуском nginx на этом порту ноду остановлю, а в конце запущу обратно."
-    warn "Важно: дальше ${NODE_HOLDS[*]} будет у nginx. Инбаунд на этом порту в профиле ноды перенеси на другой порт"
-    warn "или убери — иначе Xray на ноде не запустится."
-    confirm_yn "Продолжить?" y || die "Остановлено — порт ${NODE_HOLDS[*]} оставлен ноде"
-  fi
-
-  # XHTTP-инбаунд должен слушать только 127.0.0.1. Если порт занят снаружи (например, прямым REALITY) —
-  # инбаунд на нём не поднимется.
+  # XHTTP-инбаунд должен слушать только 127.0.0.1. Если порт занят снаружи — инбаунд на нём не поднимется.
   local addrs
   addrs=$(ss -Htln "sport = :$XHTTP_PORT" 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' | paste -sd' ' - || true)
   if [[ -n $addrs ]]; then
     warn "Порт $XHTTP_PORT уже слушается не только на 127.0.0.1 ($addrs) — XHTTP-инбаунд на нём не поднимется."
     warn "Освободи порт или запусти скрипт с --xhttp-port <другой порт>"
     confirm_yn "Продолжить всё равно?" n || die "Остановлено: порт $XHTTP_PORT занят"
+  fi
+
+  if (( NODE_NEEDS_SHM )); then
+    warn "Чтобы Xray видел сокет nginx, ноде ($NODE_SVC) нужен общий $SHM_MOUNT."
+    warn "Добавлю его в $COMPOSE, и в конце нода перезапустится (несколько секунд простоя)."
+    confirm_yn "Продолжить?" y || die "Остановлено — без общего /dev/shm Xray не достучится до nginx"
   fi
 }
 
@@ -786,7 +883,7 @@ setup_ufw() {
   UFW_SUMMARY+=("SSH: $(printf '%s\n' 22 $ssh_ports | sort -un | paste -sd, -)")
 
   ufw allow 80/tcp comment 'HTTP (certbot)' >/dev/null
-  ufw allow 443/tcp comment 'HTTPS (nginx)' >/dev/null
+  ufw allow 443/tcp comment 'HTTPS Xray REALITY' >/dev/null
   UFW_SUMMARY+=("80, 443: для всех")
 
   for p in ${NODE_PUBLIC_PORTS[@]+"${NODE_PUBLIC_PORTS[@]}"}; do
@@ -954,47 +1051,119 @@ make_index() {
   log "Заглушка: $f"
 }
 
-finish() {
-  local code s
-  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-         --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/" 2>/dev/null || true)
+# Пересоздать ноду (подключить /dev/shm) или просто перезапустить (443 освободился от старого nginx)
+recreate_node() {
+  local out
+  if (( NODE_NEEDS_SHM )); then
+    log "Пересоздаю ноду ($NODE_SVC), чтобы подключился $SHM_MOUNT…"
+    out=$(docker compose -f "$COMPOSE" up -d "$NODE_SVC" 2>&1) \
+      || { printf '%s\n' "$out" >&2; die "Не удалось пересоздать ноду. Запусти вручную: cd $INSTALL_DIR && docker compose up -d $NODE_SVC"; }
+  elif (( NODE_KICK )); then
+    log "Перезапускаю ноду ($NODE_SVC), чтобы Xray занял освободившийся 443…"
+    out=$(docker compose -f "$COMPOSE" restart "$NODE_SVC" 2>&1) \
+      || { printf '%s\n' "$out" >&2; die "Не удалось перезапустить ноду. Запусти вручную: cd $INSTALL_DIR && docker compose restart $NODE_SVC"; }
+  else
+    return 0
+  fi
+  NODE_RECREATED=1
+  log "Нода перезапущена"
+}
 
-  hdr "Для панели Remnawave"
-  echo "  Инбаунд:  VLESS, xhttp, security none, listen 127.0.0.1, port $XHTTP_PORT, path $XHTTP_PATH"
-  echo "  Хост:     адрес $DOMAIN, порт 443, TLS, SNI $DOMAIN, XHTTP mode packet-up"
-  if (( ! NO_UFW )); then
-    echo "  UFW:"
-    for s in "${UFW_SUMMARY[@]}"; do echo "    - $s"; done
-    echo "    Новый инбаунд на публичном порту — открой его: ufw allow <порт>"
+gen_inbounds() {
+  cat <<EOF
+{
+  "tag": "REALITY_SELFSTEAL",
+  "listen": "0.0.0.0",
+  "port": 443,
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "streamSettings": {
+    "network": "raw",
+    "security": "reality",
+    "realitySettings": {
+      "target": "${SOCK}",
+      "xver": 1,
+      "serverNames": ["${DOMAIN}"],
+      "privateKey": "СГЕНЕРИРУЙ_В_ПАНЕЛИ",
+      "shortIds": [""]
+    }
+  }
+},
+{
+  "tag": "XHTTP_NGINX",
+  "listen": "127.0.0.1",
+  "port": ${XHTTP_PORT},
+  "protocol": "vless",
+  "settings": { "clients": [], "decryption": "none" },
+  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
+  "streamSettings": {
+    "network": "xhttp",
+    "security": "none",
+    "xhttpSettings": { "path": "${XHTTP_PATH}", "mode": "auto" }
+  }
+}
+EOF
+}
+
+finish() {
+  local sock_code tls_code="" s _
+
+  sock_code=$(sock_http_code)
+  # Нода только что перезапущена — дадим ей получить конфиг от панели и занять 443
+  if (( NODE_RECREATED )); then
+    log "Жду, пока нода получит конфиг от панели (до 30 секунд)…"
+    for _ in $(seq 1 15); do
+      [[ $(port_status 443) == node:* ]] && break
+      sleep 2
+    done
+  fi
+  # Если 443 у Xray — проверим весь путь: 443 → REALITY → сокет → nginx
+  if [[ $(port_status 443) == node:* ]]; then
+    for _ in $(seq 1 5); do
+      tls_code=$(tls_443_code)
+      [[ $tls_code == 200 ]] && break
+      sleep 2
+    done
   fi
 
-  if (( ${#NODE_HOLDS[@]} )); then
-    echo
-    if (( NODE_BIND_FAIL )); then
-      warn "Xray на ноде НЕ запустился: порт ${NODE_HOLDS[*]} теперь у nginx."
-      warn "В панели перенеси инбаунд с ${NODE_HOLDS[*]} на другой порт (и открой его: ufw allow <порт>)"
-      warn "или назначь ноде профиль, где на ${NODE_HOLDS[*]} ничего нет. Пока это не сделано — нода offline."
-    else
-      warn "Порт ${NODE_HOLDS[*]} теперь у nginx. Если в профиле ноды остался инбаунд на ${NODE_HOLDS[*]} — перенеси его,"
-      warn "иначе Xray не запустится. Проверь в панели, что нода Online."
-    fi
+  { echo "["; gen_inbounds; echo "]"; } >"$INBOUNDS_JSON"
+  hdr "Для панели Remnawave"
+  echo "1) В Config Profile этой ноды — два инбаунда (копия: $INBOUNDS_JSON):"
+  echo
+  gen_inbounds | sed 's/^/   /'
+  echo
+  echo "   privateKey и shortIds сгенерируй в панели. Если на 443 у ноды уже есть REALITY —"
+  echo "   поменяй в нём target на ${SOCK}, добавь \"xver\": 1 и ${DOMAIN} в serverNames."
+  echo "2) Включи оба инбаунда на ноде и добавь их во внутренний сквад."
+  echo "3) Хосты:"
+  echo "   REALITY: адрес ${DOMAIN}, порт 443, SNI ${DOMAIN}, fingerprint chrome"
+  echo "   XHTTP:   адрес ${DOMAIN}, порт 443, TLS, SNI ${DOMAIN}, XHTTP mode packet-up"
+  if (( ! NO_UFW )); then
+    echo "4) UFW:"
+    for s in "${UFW_SUMMARY[@]}"; do echo "   - $s"; done
+    echo "   Новый инбаунд на публичном порту — открой его: ufw allow <порт>"
   fi
 
   echo
-  if [[ $code == 200 ]]; then
-    printf '%s✅ Всё готово!%s\n' "$C_G" "$C_0"
+  if [[ $tls_code == 200 ]]; then
+    printf '%s✅ Всё готово!%s Сайт открывается через 443 (REALITY → nginx).\n' "$C_G" "$C_0"
+    echo "Открой в браузере https://$DOMAIN — там должна открыться заглушка."
+  elif [[ $sock_code == 200 ]]; then
+    printf '%s✅ nginx и сертификат готовы.%s\n' "$C_G" "$C_0"
+    echo "Осталось в панели: REALITY на 443 с target ${SOCK} и xver 1 (п. 1 выше)."
+    echo "После этого открой https://$DOMAIN — там должна открыться заглушка."
   else
-    warn "Проверка с сервера вернула код '${code:-нет ответа}' — что-то может быть не так."
+    warn "Проверка через сокет вернула код '${sock_code:-нет ответа}' — что-то может быть не так."
+    echo "Открой https://$DOMAIN после настройки REALITY в панели (п. 1 выше)."
   fi
-  echo "Открой в браузере https://$DOMAIN — там должна открыться заглушка."
-  echo "Если её нет или браузер ругается на сертификат — напиши в поддержку: $SUPPORT"
+  echo "Если заглушки нет или браузер ругается на сертификат — напиши в поддержку: $SUPPORT"
 }
 
 main() {
   parse_args "$@"
   init_tty
-  trap on_exit EXIT
-  hdr "Remnawave Node: nginx + сертификат + XHTTP + UFW"
+  hdr "Remnawave Node: nginx за REALITY + сертификат + XHTTP + UFW"
   preflight
   ask_domain
   ask_path
@@ -1005,6 +1174,7 @@ main() {
 
   hdr "docker-compose.yml"
   compose_add_nginx
+  compose_node_shm
 
   hdr "nginx: 80 порт"
   prepare_dirs
@@ -1012,7 +1182,7 @@ main() {
   if user_conf_has_domain; then
     SKIP_BLOCKS=1
     warn "В $NGINX_CONF уже есть твоя настройка для $DOMAIN — её не трогаю и свои блоки не добавляю."
-    warn "Проверь сам, что XHTTP-location там ведёт на 127.0.0.1:$XHTTP_PORT."
+    warn "Проверь сам, что там есть listen unix:${SOCK} ssl proxy_protocol и XHTTP-location на 127.0.0.1:$XHTTP_PORT."
     nginx_up 0
   elif append_block http gen_http_block; then
     nginx_up 1
@@ -1028,20 +1198,29 @@ main() {
   hdr "Сертификат"
   issue_cert
 
-  hdr "nginx: 443 порт"
+  hdr "nginx: сокет ${SOCK}"
   if (( ! SKIP_BLOCKS )); then
-    if has_default_443; then ADD_DEFAULT=0; else ADD_DEFAULT=1; fi
-    if append_block https gen_https_block; then
+    if remove_block https; then
+      log "Убрал старый блок 443 для $DOMAIN (прошлая версия скрипта) — теперь 443 у Xray"
+    fi
+    if has_default_sock; then ADD_DEFAULT=0; else ADD_DEFAULT=1; fi
+    if append_block sock gen_sock_block; then
       nginx_up 1
-      log "Добавил блок 443 порта: сайт + XHTTP $XHTTP_PATH → 127.0.0.1:$XHTTP_PORT"
+      log "Добавил блок сокета: сайт + XHTTP $XHTTP_PATH → 127.0.0.1:$XHTTP_PORT"
     else
       nginx_up 0
-      log "Блок 443 порта для $DOMAIN уже есть в $NGINX_CONF"
+      log "Блок сокета для $DOMAIN уже есть в $NGINX_CONF"
     fi
   else
     nginx_up 0
   fi
-  if conf_listens 443; then wait_443; fi
+  wait_sock
+  local l443
+  l443=$(conf_443_lines)
+  if [[ -n $l443 ]]; then
+    warn "В $NGINX_CONF остались listen 443 (строки $l443) — nginx займёт 443 и Xray не сможет на нём слушать."
+    warn "Убери эти listen или переведи их на unix:${SOCK} ssl proxy_protocol."
+  fi
 
   hdr "Автопродление"
   setup_renewal
@@ -1049,10 +1228,9 @@ main() {
   hdr "Заглушка"
   make_index
 
-  if (( ${#NODE_STOPPED[@]} )); then
+  if (( NODE_NEEDS_SHM || NODE_KICK )); then
     hdr "Нода"
-    start_node
-    check_node_after_start
+    recreate_node
   fi
 
   finish
