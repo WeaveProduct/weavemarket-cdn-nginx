@@ -1,32 +1,37 @@
 # weavemarket-cdn-nginx
 
-Скрипт для ноды [Remnawave](https://docs.rw): ставит nginx на 443 порт, выпускает сертификат Let's Encrypt и проксирует XHTTP в Xray.
+Скрипт для ноды [Remnawave](https://docs.rw): ставит nginx на 443 порт, выпускает сертификат Let's Encrypt, проксирует XHTTP в Xray и настраивает UFW.
 
 После запуска на ноде будет:
 
 - `https://ваш-домен` — обычный сайт-заглушка с валидным сертификатом;
 - `https://ваш-домен/api/v1/stream/…` — XHTTP, который nginx передаёт в инбаунд Xray на `127.0.0.1:8443`;
-- автопродление сертификата.
+- автопродление сертификата;
+- UFW: открыты SSH, 80, 443 и порты инбаундов ноды, а порт ноды (2222) — только для панели.
 
 ## Быстрый старт
 
 На сервере с нодой, от root:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh)
 ```
 
 Если `raw.githubusercontent.com` недоступен с сервера, используйте зеркало:
 
 ```bash
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/WeaveProduct/weavemarket-cdn-nginx@main/installer.sh)
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/SikWeet/weavemarket-cdn-nginx@main/installer.sh)
 ```
 
-Скрипт задаст три вопроса:
+Скрипт задаст вопросы:
 
 1. **Домен** — для него настраивается nginx и выпускается сертификат.
 2. **Path для XHTTP** — Enter оставляет `/api/v1/stream`.
-3. **Email** — нужен Let's Encrypt для выпуска сертификата.
+3. **Домен или IP панели** — только с этого адреса будет разрешено подключение к ноде. Enter — не настраивать UFW.
+4. **Порт ноды** — Enter оставляет значение из `docker-compose.yml` (обычно `2222`).
+5. **Email** — нужен Let's Encrypt для выпуска сертификата.
+
+Если 443 сейчас занят самой нодой (Xray), скрипт предупредит, остановит ноду перед запуском nginx на 443 и в конце запустит её обратно. Если что-то пойдёт не так, нода тоже будет запущена обратно.
 
 В конце скрипт напишет «✅ Всё готово». Откройте свой домен в браузере: там должна быть заглушка.
 
@@ -35,8 +40,10 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/WeaveProduct/weavemarket-cdn-nginx
 - **Установленная нода.** Remnawave Node уже установлена [по документации](https://docs.rw/install/remnawave-node) в `/opt/remnanode`.
 - **Система и права.** Debian или Ubuntu, запуск от root.
 - **Домен.** A-запись домена указывает на IP этого сервера. В Cloudflare нужен режим **DNS only** (серое облако).
-- **Порты 80 и 443.** Свободны на сервере и открыты у хостера.
+- **Порты 80 и 443.** Открыты у хостера. На сервере их может занимать только сама нода — другой веб-сервер (например, nginx панели) скрипт не тронет и остановится.
+- **Инбаунд на 443.** Если в профиле ноды есть инбаунд на 443 (например, REALITY), после установки его нужно перенести на другой порт — 443 займёт nginx, и иначе Xray на ноде не запустится.
 - **Порт 8443.** Не занят снаружи, например прямым REALITY. XHTTP-инбаунд должен слушать его на `127.0.0.1`.
+- **Адрес панели.** Домен панели должен указывать прямо на сервер панели (без прокси Cloudflare), иначе UFW откроет порт ноды не тому IP и нода уйдёт в offline. Можно указать IP панели напрямую.
 
 ## Параметры
 
@@ -47,6 +54,9 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/WeaveProduct/weavemarket-cdn-nginx
 | `--domain DOMAIN` | домен для nginx и сертификата | — |
 | `--path PATH` | path для XHTTP | `/api/v1/stream` |
 | `--email EMAIL` | email для Let's Encrypt | — |
+| `--panel ADDR` | домен или IP панели — только ей откроется порт ноды в UFW | — |
+| `--node-port PORT` | порт ноды для связи с панелью | из `docker-compose.yml`, иначе `2222` |
+| `--no-ufw` | не настраивать UFW | — |
 | `--xhttp-port PORT` | порт XHTTP-инбаунда на `127.0.0.1` | `8443` |
 | `--dir DIR` | каталог ноды | `/opt/remnanode` |
 | `-y`, `--yes` | не задавать вопросов да/нет | — |
@@ -54,9 +64,11 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/WeaveProduct/weavemarket-cdn-nginx
 Пример запуска без вопросов:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh) \
-  --domain node.example.com --email you@example.com -y
+bash <(curl -fsSL https://raw.githubusercontent.com/SikWeet/weavemarket-cdn-nginx/main/installer.sh) \
+  --domain node.example.com --email you@example.com --panel panel.example.com -y
 ```
+
+Без `--panel` в режиме без вопросов UFW не настраивается.
 
 ## Что скрипт меняет
 
@@ -68,6 +80,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn
 | `/etc/letsencrypt/live/<домен>/` | сертификат |
 | `/etc/letsencrypt/renewal-hooks/deploy/remnanode-nginx-reload.sh` | перезагрузка nginx после продления |
 | `certbot.timer` или `/etc/cron.d/remnanode-certbot` | автопродление два раза в день |
+| UFW | разрешает 22 и порт SSH (если он другой), 80, 443, публичные порты инбаундов ноды; порт ноды — только с IP панели. Правило «порт ноды открыт всем», если было, удаляет. Остальные правила не трогает. Если UFW был выключен — ставит «запрещать входящие по умолчанию» и включает |
 
 Повторный запуск безопасен: уже добавленное не дублируется, готовый сертификат заново не выпускается.
 
@@ -129,6 +142,15 @@ nginx не нашёл блок 443 для домена, который вы от
 
 **«Порт 8443 уже слушается не только на 127.0.0.1»**
 На 8443 висит что-то снаружи. Освободите порт или запустите скрипт с `--xhttp-port <другой порт>`. Этот же порт укажите в инбаунде.
+
+**«Xray на ноде НЕ запустился» / нода offline после установки**
+В профиле ноды остался инбаунд на 443, а 443 теперь у nginx. В панели перенесите этот инбаунд на другой порт и откройте его: `ufw allow <порт>`. Либо назначьте ноде профиль без инбаунда на 443.
+
+**Нода offline, а Xray не ругается**
+Скорее всего, UFW не пускает панель: адрес панели указывает не на её сервер (например, домен за Cloudflare). Проверьте `ufw status` и при необходимости разрешите IP панели: `ufw allow from <IP панели> to any port 2222 proto tcp`.
+
+**«Порт 443 занят: …»**
+443 держит не нода, а другой процесс (например, nginx панели на этом же сервере). Скрипт его не останавливает — ставьте ноду на отдельный сервер.
 
 **Нужно изменить path или порт**
 Удалите в `nginx.conf` участок от `# >>> remnanode-setup https <домен>` до `# <<< remnanode-setup https <домен>` и запустите скрипт заново с новыми значениями.
