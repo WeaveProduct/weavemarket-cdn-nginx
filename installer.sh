@@ -1,40 +1,38 @@
 #!/usr/bin/env bash
-# installer.sh (weavemarket-cdn-nginx) — nginx за REALITY (unix-сокет) + сертификат Let's Encrypt + XHTTP + UFW
-# для Remnawave Node
+# installer.sh (weavemarket-cdn-nginx) — nginx + сертификат Let's Encrypt + XHTTP + UFW для Remnawave Node
 #
 # Запуск на сервере с нодой, от root:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh)
 #
-# Схема: 443 держит Xray (REALITY). Всё, что не прошло авторизацию REALITY (браузеры, сканеры, CDN),
-# Xray отдаёт в nginx через unix:/dev/shm/nginx.sock (PROXY protocol). nginx показывает сайт-заглушку
-# с настоящим сертификатом и проксирует XHTTP-path на инбаунд Xray 127.0.0.1:8443.
+# Два режима (скрипт спросит первым делом):
+#   1) eGames — как в скрипте eGames (remnawave-reverse-proxy): nginx слушает unix:/dev/shm/nginx.sock
+#      за Xray. Порт 443 остаётся свободным для Xray (REALITY), всё постороннее Xray отдаёт в nginx.
+#   2) docs   — как в официальной документации Remnawave: nginx сам слушает порт 443.
+#      Порт 443 будет занят nginx, инбаунды Xray на 443 работать не смогут.
 #
-# Скрипт спросит домен, path для XHTTP, адрес панели и порт ноды, затем:
-#   1. добавит сервис nginx в /opt/remnanode/docker-compose.yml, а ноде — общий /dev/shm
-#      (остальное не трогает, отступы как в файле)
-#   2. допишет в конец /opt/remnanode/nginx.conf блок для 80 порта и запустит nginx
-#   3. настроит UFW: 22 (SSH), 80, 443, порты инбаундов ноды; порт ноды — только для панели
-#   4. спросит email и выпустит сертификат через certbot (webroot)
-#   5. допишет блок для сокета: listen unix:/dev/shm/nginx.sock ssl proxy_protocol + http2
-#   6. включит автопродление сертификатов (с перезагрузкой nginx после продления)
-#   7. создаст заглушку /opt/remnanode/www/index.html
-#   8. перезапустит ноду, если ей добавлялся /dev/shm, и покажет инбаунды для панели
+# В обоих режимах скрипт:
+#   - добавит сервис nginx в /opt/remnanode/docker-compose.yml (остальное не трогает, отступы как в файле)
+#   - допишет в конец /opt/remnanode/nginx.conf блок для 80 порта и выпустит сертификат (certbot, webroot)
+#   - допишет основной блок: сайт-заглушка + проксирование XHTTP на 127.0.0.1:<порт> (по умолчанию 4443)
+#   - настроит UFW, автопродление сертификата и заглушку /opt/remnanode/www/index.html
+#   - в конце даст ссылку на готовые конфиги: https://weavemarket-cdn.vercel.app
 #
 # Повторный запуск безопасен: уже добавленное не дублируется, чужие настройки не трогаются.
 # Без вопросов:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-cdn-nginx/main/installer.sh) \
-#     --domain node.example.com --email you@example.com --panel panel.example.com -y
+#     --mode egames --domain node.example.com --email you@example.com --panel panel.example.com -y
 
 set -Eeuo pipefail
 
 # ─── Настройки ───────────────────────────────────────────────────────────────
 INSTALL_DIR="/opt/remnanode"
-DOMAIN="" XHTTP_PATH="" EMAIL="" PANEL_ADDR="" NODE_PORT=""
-XHTTP_PORT="8443"
+MODE="" DOMAIN="" XHTTP_PATH="" XHTTP_PORT="" EMAIL="" PANEL_ADDR="" NODE_PORT=""
 ASSUME_YES=0 NO_UFW=0
 
-DEFAULT_PATH="/api/v1/stream"
+DEFAULT_PATH="/api/video/stream"
+DEFAULT_XHTTP_PORT="4443"
 DEFAULT_NODE_PORT="2222"
+CONFIGS_URL="https://weavemarket-cdn.vercel.app"
 NGINX_IMAGE="nginx:1.30-alpine"
 CONTAINER="remnanode-nginx"
 SOCK="/dev/shm/nginx.sock"
@@ -47,7 +45,8 @@ INSTALL_CMD="bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/we
 
 TTY="" HAS_IPV6=0 RECREATE=0 SKIP_BLOCKS=0 ADD_DEFAULT=0 ROLLBACK_SIZE=0
 NODE_PROJECT="" NODE_SVC="" NODE_NEEDS_SHM=0 NODE_KICK=0 NODE_RECREATED=0 COMPOSE_BAK=""
-NODE_PUBLIC_PORTS=() PANEL_IPS=() UFW_SUMMARY=()
+NODE_NAMES="" NODE_START_TS="" NODE_BIND_FAIL=0
+NODE_HOLDS=() NODE_STOPPED=() NODE_RESTARTED=() NODE_PUBLIC_PORTS=() PANEL_IPS=() UFW_SUMMARY=()
 
 # ─── Вывод ───────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -72,13 +71,15 @@ usage() {
   (всё спросит сам)
 
 Параметры (необязательные — чтобы не отвечать на вопросы):
+  --mode MODE          egames — nginx на unix-сокете за Xray, порт 443 свободен для Xray (REALITY)
+                       docs   — nginx сам слушает 443, как в официальной документации
   --domain DOMAIN      домен для настройки и сертификата
+  --xhttp-port PORT    порт XHTTP-инбаунда на 127.0.0.1 (по умолчанию ${DEFAULT_XHTTP_PORT})
   --path PATH          path для XHTTP (по умолчанию ${DEFAULT_PATH})
   --email EMAIL        email для Let's Encrypt
   --panel ADDR         домен или IP панели — только ей будет открыт порт ноды в UFW
   --node-port PORT     порт ноды для связи с панелью (по умолчанию из docker-compose.yml, иначе ${DEFAULT_NODE_PORT})
   --no-ufw             не настраивать UFW
-  --xhttp-port PORT    порт XHTTP-инбаунда на 127.0.0.1 (по умолчанию 8443)
   --dir DIR            каталог ноды (по умолчанию /opt/remnanode)
   -y, --yes            не задавать вопросов да/нет (берутся ответы по умолчанию)
   -h, --help           эта справка
@@ -258,6 +259,68 @@ collect_node_ports() {
   done
 }
 
+# ─── Режим docs: остановка / запуск ноды, если она держит 80/443 ─────────────
+stop_node() {
+  (( ${#NODE_HOLDS[@]} )) || return 0
+  (( ${#NODE_STOPPED[@]} == 0 )) || return 0
+  local n _ p busy
+  for n in $NODE_NAMES; do
+    log "Останавливаю ноду ($n) — порт ${NODE_HOLDS[*]} нужен nginx"
+    docker stop -t 20 "$n" >/dev/null
+    NODE_STOPPED+=("$n")
+  done
+  for _ in $(seq 1 15); do
+    busy=0
+    for p in "${NODE_HOLDS[@]}"; do
+      case $(port_status "$p") in free|ours) ;; *) busy=1 ;; esac
+    done
+    (( busy )) || return 0
+    sleep 1
+  done
+  die "Нода остановлена, но порт ${NODE_HOLDS[*]} всё ещё занят"
+}
+
+start_node() {
+  (( ${#NODE_STOPPED[@]} )) || return 0
+  local n
+  NODE_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  for n in "${NODE_STOPPED[@]}"; do
+    if docker start "$n" >/dev/null 2>&1; then
+      log "Нода ($n) снова запущена"
+      NODE_RESTARTED+=("$n")
+    else
+      warn "Не смог запустить ноду ($n) — запусти вручную: docker start $n"
+    fi
+  done
+  NODE_STOPPED=()
+}
+
+# После запуска: поднялся ли Xray или упал на занятом порту
+check_node_after_start() {
+  (( ${#NODE_RESTARTED[@]} )) || return 0
+  local _ n logs
+  log "Жду, пока нода получит конфиг от панели (до 30 секунд)…"
+  for _ in $(seq 1 15); do
+    sleep 2
+    for n in "${NODE_RESTARTED[@]}"; do
+      logs=$(docker logs --since "$NODE_START_TS" "$n" 2>&1 || true)
+      if grep -qiE 'address already in use' <<<"$logs"; then NODE_BIND_FAIL=1; return 0; fi
+    done
+  done
+}
+
+# При любом выходе (в том числе по ошибке) — вернуть ноду
+on_exit() {
+  local rc=$?
+  trap - ERR
+  set +e
+  if (( ${#NODE_STOPPED[@]} )); then
+    warn "Возвращаю ноду…"
+    start_node
+  fi
+  exit "$rc"
+}
+
 # ─── docker-compose.yml ──────────────────────────────────────────────────────
 # Отступы в compose: "S U L HAS_NGINX FOUND"
 #   S — отступ имён сервисов, U — шаг до их ключей, L — отступ элементов списка от ключа
@@ -400,19 +463,19 @@ gen_compose_block() { # S U L
   s=$(printf '%*s' "$1" '')
   k=$(printf '%*s' "$(( $1 + $2 ))" '')
   i=$(printf '%*s' "$(( $1 + $2 + $3 ))" '')
-  cat <<EOF
-${s}nginx:
-${k}image: ${NGINX_IMAGE}
-${k}container_name: ${CONTAINER}
-${k}restart: always
-${k}network_mode: host
-${k}command: ["/bin/sh", "-c", "rm -f ${SOCK}; exec nginx -g 'daemon off;'"]
-${k}volumes:
-${i}- ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-${i}- ${LE_DIR}:${LE_DIR}:ro
-${i}- ./www:/var/www/html:ro
-${i}- ${SHM_MOUNT}
-EOF
+  printf '%s\n' "${s}nginx:" \
+    "${k}image: ${NGINX_IMAGE}" \
+    "${k}container_name: ${CONTAINER}" \
+    "${k}restart: always" \
+    "${k}network_mode: host"
+  if [[ $MODE == egames ]]; then
+    printf '%s\n' "${k}command: [\"/bin/sh\", \"-c\", \"rm -f ${SOCK}; exec nginx -g 'daemon off;'\"]"
+  fi
+  printf '%s\n' "${k}volumes:" \
+    "${i}- ./nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
+    "${i}- ${LE_DIR}:${LE_DIR}:ro" \
+    "${i}- ./www:/var/www/html:ro"
+  if [[ $MODE == egames ]]; then printf '%s\n' "${i}- ${SHM_MOUNT}"; fi
 }
 
 # Вставить блок в конец секции services: (перед следующим ключом верхнего уровня или в конец файла)
@@ -434,7 +497,7 @@ compose_add_nginx() {
   local svc s u l has_nginx found blockf tmp
   svc=$(compose_find_service "$CONTAINER" "")
   if [[ -n $svc ]]; then
-    if compose_add_shm "$svc"; then
+    if [[ $MODE == egames ]] && compose_add_shm "$svc"; then
       log "Добавил $SHM_MOUNT в сервис $svc (nginx)"
       RECREATE=1
     else
@@ -509,7 +572,18 @@ has_default_sock() {
   grep -Eq "$re" "$NGINX_CONF"
 }
 
-# Строки nginx.conf, где nginx слушает 443 (они отберут порт у Xray)
+has_default_443() {
+  local re='^[^#]*listen[[:space:]]+([^;[:space:]]*:)?443[^;]*default_server'
+  grep -Eq "$re" "$NGINX_CONF"
+}
+
+# Слушает ли nginx порт PORT по текущему nginx.conf (80 — всегда)
+conf_listens() {
+  [[ $1 == 80 ]] && return 0
+  grep -Eq "^[^#]*listen[[:space:]]+([^;[:space:]]*:)?$1([^0-9]|\$)" "$NGINX_CONF"
+}
+
+# Строки nginx.conf, где nginx слушает 443 (в режиме eGames они отберут порт у Xray)
 conf_443_lines() {
   grep -nE '^[^#]*listen[[:space:]]+([^;[:space:]]*:)?443([^0-9]|$)' "$NGINX_CONF" | cut -d: -f1 | paste -sd, - || true
 }
@@ -523,41 +597,18 @@ server {
     listen 80;${v6}
     server_name ${DOMAIN};
 
-    # проверка домена для Let's Encrypt
     location /.well-known/acme-challenge/ { root /var/www/html; }
-
     location / { return 301 https://\$host\$request_uri; }
 }
 # <<< ${MARK} http ${DOMAIN}
 EOF
 }
 
-gen_default_block() {
+# Общая часть сайта: буферы, сертификат, заглушка, XHTTP-location. REAL_IP — переменная с IP клиента.
+gen_site_body() { # REAL_IP
   cat <<EOF
-
-# Запросы не на наши домены (сканеры с чужим SNI и т.п.) — обрываем на TLS-рукопожатии
-server {
-    listen unix:${SOCK} ssl proxy_protocol default_server;
-    server_name _;
-    ssl_reject_handshake on;
-}
-EOF
-}
-
-gen_sock_block() {
-  local def=""
-  if (( ADD_DEFAULT )); then def=$(gen_default_block); fi
-  cat <<EOF
-# >>> ${MARK} sock ${DOMAIN}
-# Сюда приходит всё, что Xray (REALITY на 443) не авторизовал: target = ${SOCK}, xver = 1
-server {
-    listen unix:${SOCK} ssl proxy_protocol;
-    http2 on;
-    server_name ${DOMAIN};
-
-    # настоящий IP клиента приходит от Xray по PROXY protocol
-    set_real_ip_from unix:;
-    real_ip_header proxy_protocol;
+    client_header_buffer_size 16k;
+    large_client_header_buffers 8 64k;
 
     ssl_certificate     ${LE_DIR}/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key ${LE_DIR}/live/${DOMAIN}/privkey.pem;
@@ -572,21 +623,81 @@ server {
     client_header_timeout 5m;
     keepalive_timeout     5m;
 
-    # XHTTP -> инбаунд Xray на 127.0.0.1:${XHTTP_PORT} (HTTP/1.1, режим packet-up)
     location ${XHTTP_PATH}/ {
         proxy_pass http://127.0.0.1:${XHTTP_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$proxy_protocol_addr;
-        proxy_set_header X-Forwarded-For \$proxy_protocol_addr;
+        proxy_set_header X-Real-IP $1;
+        proxy_set_header X-Forwarded-For $1;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_read_timeout 900s;
         proxy_send_timeout 900s;
         client_max_body_size 0;
     }
+EOF
+}
+
+# Режим eGames: nginx на unix-сокете за Xray (REALITY target = сокет, xver = 1)
+gen_sock_block() {
+  local def=""
+  if (( ADD_DEFAULT )); then
+    def=$(cat <<EOF
+
+
+server {
+    listen unix:${SOCK} ssl proxy_protocol default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+EOF
+)
+  fi
+  cat <<EOF
+# >>> ${MARK} sock ${DOMAIN}
+server {
+    listen unix:${SOCK} ssl proxy_protocol;
+    http2 on;
+    server_name ${DOMAIN};
+
+    set_real_ip_from unix:;
+    real_ip_header proxy_protocol;
+
+$(gen_site_body '$proxy_protocol_addr')
 }${def}
 # <<< ${MARK} sock ${DOMAIN}
+EOF
+}
+
+# Режим docs: nginx сам слушает 443
+gen_https_block() {
+  local v6="" def="" dv6=""
+  if (( HAS_IPV6 )); then
+    v6=$'\n    listen [::]:443 ssl;'
+    dv6=$'\n    listen [::]:443 ssl default_server;'
+  fi
+  if (( ADD_DEFAULT )); then
+    def=$(cat <<EOF
+
+
+server {
+    listen 443 ssl default_server;${dv6}
+    server_name _;
+    ssl_reject_handshake on;
+}
+EOF
+)
+  fi
+  cat <<EOF
+# >>> ${MARK} https ${DOMAIN}
+server {
+    listen 443 ssl;${v6}
+    http2 on;
+    server_name ${DOMAIN};
+
+$(gen_site_body '$remote_addr')
+}${def}
+# <<< ${MARK} https ${DOMAIN}
 EOF
 }
 
@@ -638,10 +749,20 @@ clear_stale_sock() {
   if [[ -S $SOCK ]] && ! sock_listening; then rm -f "$SOCK"; fi
 }
 
+# Режим docs: освободить для nginx порты, которые держит нода (только те, что nginx реально слушает)
+free_ports_for_nginx() {
+  [[ $MODE == docs ]] || return 0
+  local p
+  for p in ${NODE_HOLDS[@]+"${NODE_HOLDS[@]}"}; do
+    if conf_listens "$p"; then stop_node; return 0; fi
+  done
+}
+
 # Применить nginx.conf: перечитать работающий nginx или (пере)создать контейнер.
 # nginx_up 1 — при ошибке убрать только что дописанный блок.
 nginx_up() {
   local rb=${1:-0} out extra=()
+  free_ports_for_nginx
   if container_running && (( ! RECREATE )); then
     if ! out=$(docker exec "$CONTAINER" nginx -t 2>&1); then
       printf '%s\n' "$out" | tail -n 5 >&2 || true
@@ -677,13 +798,24 @@ wait_sock() {
   die "nginx не создал сокет $SOCK (лог выше)"
 }
 
+# nginx действительно слушает 443 (а не остался на старом конфиге из-за занятого порта)
+wait_443() {
+  local _
+  for _ in $(seq 1 10); do
+    [[ $(port_status 443) == ours ]] && return 0
+    sleep 1
+  done
+  docker logs --tail 10 "$CONTAINER" >&2 2>&1 || true
+  die "nginx не смог занять 443 порт (лог выше): $(port_status 443)"
+}
+
 # Код ответа сайта через сокет — так, как его увидит Xray
 sock_http_code() {
   curl -s -o /dev/null -w '%{http_code}' --max-time 5 --unix-socket "$SOCK" --haproxy-protocol \
     "https://$DOMAIN/" 2>/dev/null || true
 }
 
-# Код ответа через 443 (через REALITY → сокет), если 443 слушает нода
+# Код ответа через 443 на этом сервере
 tls_443_code() {
   curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:127.0.0.1" \
     "https://$DOMAIN/" 2>/dev/null || true
@@ -703,9 +835,10 @@ selftest_challenge() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case $1 in
-      --domain|--path|--email|--panel|--node-port|--xhttp-port|--dir)
+      --mode|--domain|--path|--email|--panel|--node-port|--xhttp-port|--dir)
         [[ $# -ge 2 && -n ${2:-} ]] || die "Параметру $1 нужно значение"
         case $1 in
+          --mode)       MODE=$2 ;;
           --domain)     DOMAIN=$2 ;;
           --path)       XHTTP_PATH=$2 ;;
           --email)      EMAIL=$2 ;;
@@ -724,10 +857,14 @@ parse_args() {
   COMPOSE="$INSTALL_DIR/docker-compose.yml"
   NGINX_CONF="$INSTALL_DIR/nginx.conf"
   WWW_DIR="$INSTALL_DIR/www"
-  INBOUNDS_JSON="$INSTALL_DIR/remnawave-inbounds.json"
-  is_port "$XHTTP_PORT" || die "Некорректный --xhttp-port: $XHTTP_PORT"
-  XHTTP_PORT=$(( 10#$XHTTP_PORT ))
+  if [[ -n $XHTTP_PORT ]]; then is_port "$XHTTP_PORT" || die "Некорректный --xhttp-port: $XHTTP_PORT"; fi
   if [[ -n $NODE_PORT ]]; then is_port "$NODE_PORT" || die "Некорректный --node-port: $NODE_PORT"; fi
+  case ${MODE,,} in
+    "") ;;
+    1|egames|socket) MODE=egames ;;
+    2|docs|doc|official) MODE=docs ;;
+    *) die "Неизвестный --mode: $MODE (egames или docs)" ;;
+  esac
 }
 
 preflight() {
@@ -740,10 +877,43 @@ preflight() {
   if [[ -s /proc/net/if_inet6 ]]; then HAS_IPV6=1; fi
   NODE_PROJECT=$(compose_project)
   NODE_SVC=$(compose_find_service remnanode remnawave/node)
-  [[ -n $NODE_SVC ]] || die "В $COMPOSE не нашёл сервис ноды (container_name remnanode или образ remnawave/node)"
-  local rc=0
-  compose_edit_volume "$NODE_SVC" "$SHM_MOUNT" /dev/null || rc=$?
-  if (( rc == 0 )); then NODE_NEEDS_SHM=1; fi
+}
+
+ask_mode() {
+  [[ -n $MODE ]] && return 0
+  if [[ -z $TTY ]]; then
+    MODE=egames
+    log "Режим не задан (--mode) — беру eGames: nginx на сокете, 443 свободен для Xray"
+    return 0
+  fi
+  cat >"$TTY" <<EOF
+
+Как настроить ноду?
+
+  1) По скрипту eGames — nginx слушает unix-сокет ${SOCK} за Xray.
+     Порт 443 будет СВОБОДЕН: его держит Xray (REALITY), а сайт и XHTTP
+     работают через сокет. REALITY и XHTTP живут на одном 443.
+
+  2) По официальной документации Remnawave — nginx сам слушает порт 443.
+     Порт 443 будет ЗАНЯТ nginx: инбаунды Xray (например, REALITY) на 443
+     работать не смогут — их нужно держать на других портах.
+
+EOF
+  local a=""
+  while :; do
+    printf 'Выбери 1 или 2 [1]: ' >"$TTY"
+    IFS= read -r a <"$TTY" || true
+    case $(trim "$a") in
+      ""|1) MODE=egames; return 0 ;;
+      2)    MODE=docs;   return 0 ;;
+      *)    warn "Нужно ввести 1 или 2" ;;
+    esac
+  done
+}
+
+mode_title() {
+  if [[ $MODE == egames ]]; then echo "eGames: nginx на сокете ${SOCK}, 443 свободен для Xray"
+  else echo "официальная документация: nginx слушает 443"; fi
 }
 
 ask_domain() {
@@ -756,12 +926,42 @@ ask_domain() {
   done
 }
 
-ask_path() {
+# Пояснение перед вопросом — только если вопрос действительно будет задан
+explain() { # VAR TEXT...
+  local __var=$1; shift
+  [[ -z ${!__var:-} && -n $TTY ]] || return 0
+  printf '\n' >"$TTY"
+  printf '%s\n' "$@" >"$TTY"
+}
+
+ask_xhttp_port() {
+  explain XHTTP_PORT \
+    "Порт должен совпадать с вашим конфигом. Например: ${DEFAULT_XHTTP_PORT} должен быть указан" \
+    "и в nginx, и в inbound вашего конфига. Порт по умолчанию: ${DEFAULT_XHTTP_PORT}"
   while :; do
-    ask XHTTP_PATH "Path для XHTTP" "$DEFAULT_PATH"
+    ask XHTTP_PORT "Порт XHTTP" "$DEFAULT_XHTTP_PORT"
+    if is_port "$XHTTP_PORT"; then
+      XHTTP_PORT=$(( 10#$XHTTP_PORT ))
+      case $XHTTP_PORT in
+        80|443) retry_or_die "Порт $XHTTP_PORT нельзя: он нужен nginx и Xray" ;;
+        *) return 0 ;;
+      esac
+    else
+      retry_or_die "Некорректный порт: '$XHTTP_PORT'"
+    fi
+    XHTTP_PORT=""
+  done
+}
+
+ask_path() {
+  explain XHTTP_PATH \
+    "Путь должен совпадать с вашим конфигом. Например: ${DEFAULT_PATH} должен быть указан" \
+    "и в nginx, и в inbound вашего конфига. Путь по умолчанию: ${DEFAULT_PATH}"
+  while :; do
+    ask XHTTP_PATH "Путь XHTTP" "$DEFAULT_PATH"
     XHTTP_PATH=$(norm_path "$XHTTP_PATH")
     if is_path "$XHTTP_PATH"; then return 0; fi
-    retry_or_die "Некорректный path: '$XHTTP_PATH' (латиница, цифры, . _ ~ - /)"
+    retry_or_die "Некорректный путь: '$XHTTP_PATH' (латиница, цифры, . _ ~ - /)"
     XHTTP_PATH=""
   done
 }
@@ -838,8 +1038,21 @@ check_dns() {
   confirm_yn "Продолжить всё равно?" y || die "Остановлено. Поправь DNS и запусти скрипт снова"
 }
 
-check_ports() {
-  local st
+check_xhttp_port() {
+  # XHTTP-инбаунд должен слушать только 127.0.0.1. Если порт занят снаружи — инбаунд на нём не поднимется.
+  local addrs
+  addrs=$(ss -Htln "sport = :$XHTTP_PORT" 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' | paste -sd' ' - || true)
+  if [[ -n $addrs ]]; then
+    warn "Порт $XHTTP_PORT уже слушается не только на 127.0.0.1 ($addrs) — XHTTP-инбаунд на нём не поднимется."
+    warn "Освободи порт или запусти скрипт с --xhttp-port <другой порт>"
+    confirm_yn "Продолжить всё равно?" n || die "Остановлено: порт $XHTTP_PORT занят"
+  fi
+}
+
+check_ports_egames() {
+  local st rc=0
+  [[ -n $NODE_SVC ]] || die "В $COMPOSE не нашёл сервис ноды (container_name remnanode или образ remnawave/node)"
+
   st=$(port_status 80)
   case $st in
     free|ours) ;;
@@ -849,26 +1062,42 @@ check_ports() {
 
   st=$(port_status 443)
   case $st in
-    foreign:*) warn "443 сейчас занят: ${st#foreign:}. По этой схеме 443 должен держать Xray (REALITY) — освободи порт." ;;
-    ours)      log "443 сейчас держит nginx (старая схема) — переведу его на сокет и отдам 443 Xray"
+    foreign:*) warn "443 сейчас занят: ${st#foreign:}. В этом режиме 443 должен держать Xray (REALITY) — освободи порт." ;;
+    ours)      log "443 сейчас держит nginx (режим документации) — переведу nginx на сокет и отдам 443 Xray"
                NODE_KICK=1 ;;
   esac
   collect_node_ports
+  check_xhttp_port
 
-  # XHTTP-инбаунд должен слушать только 127.0.0.1. Если порт занят снаружи — инбаунд на нём не поднимется.
-  local addrs
-  addrs=$(ss -Htln "sport = :$XHTTP_PORT" 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.0\.0\.1|\[::1\]):' | paste -sd' ' - || true)
-  if [[ -n $addrs ]]; then
-    warn "Порт $XHTTP_PORT уже слушается не только на 127.0.0.1 ($addrs) — XHTTP-инбаунд на нём не поднимется."
-    warn "Освободи порт или запусти скрипт с --xhttp-port <другой порт>"
-    confirm_yn "Продолжить всё равно?" n || die "Остановлено: порт $XHTTP_PORT занят"
-  fi
-
-  if (( NODE_NEEDS_SHM )); then
+  compose_edit_volume "$NODE_SVC" "$SHM_MOUNT" /dev/null || rc=$?
+  if (( rc == 0 )); then
+    NODE_NEEDS_SHM=1
     warn "Чтобы Xray видел сокет nginx, ноде ($NODE_SVC) нужен общий $SHM_MOUNT."
     warn "Добавлю его в $COMPOSE, и в конце нода перезапустится (несколько секунд простоя)."
     confirm_yn "Продолжить?" y || die "Остановлено — без общего /dev/shm Xray не достучится до nginx"
   fi
+}
+
+check_ports_docs() {
+  local p st
+  for p in 80 443; do
+    st=$(port_status "$p")
+    case $st in
+      free|ours) ;;
+      node:*)    NODE_HOLDS+=("$p"); NODE_NAMES=${st#node:} ;;
+      foreign:*) die "Порт $p занят: ${st#foreign:}. В этом режиме nginx нужны свободные 80 и 443" ;;
+    esac
+  done
+  collect_node_ports
+
+  if (( ${#NODE_HOLDS[@]} )); then
+    warn "Порт ${NODE_HOLDS[*]} сейчас слушает нода ($NODE_NAMES, Xray)."
+    warn "Перед запуском nginx на этом порту ноду остановлю, а в конце запущу обратно."
+    warn "Важно: дальше ${NODE_HOLDS[*]} будет у nginx. Инбаунд на этом порту в профиле ноды перенеси на другой порт"
+    warn "или убери — иначе Xray на ноде не запустится. Если хочешь оставить 443 за Xray — выбери режим eGames."
+    confirm_yn "Продолжить?" y || die "Остановлено — порт ${NODE_HOLDS[*]} оставлен ноде"
+  fi
+  check_xhttp_port
 }
 
 setup_ufw() {
@@ -883,7 +1112,7 @@ setup_ufw() {
   UFW_SUMMARY+=("SSH: $(printf '%s\n' 22 $ssh_ports | sort -un | paste -sd, -)")
 
   ufw allow 80/tcp comment 'HTTP (certbot)' >/dev/null
-  ufw allow 443/tcp comment 'HTTPS Xray REALITY' >/dev/null
+  ufw allow 443/tcp comment 'HTTPS' >/dev/null
   UFW_SUMMARY+=("80, 443: для всех")
 
   for p in ${NODE_PUBLIC_PORTS[@]+"${NODE_PUBLIC_PORTS[@]}"}; do
@@ -1051,7 +1280,7 @@ make_index() {
   log "Заглушка: $f"
 }
 
-# Пересоздать ноду (подключить /dev/shm) или просто перезапустить (443 освободился от старого nginx)
+# Режим eGames: пересоздать ноду (подключить /dev/shm) или перезапустить (443 освободился от nginx)
 recreate_node() {
   local out
   if (( NODE_NEEDS_SHM )); then
@@ -1069,112 +1298,83 @@ recreate_node() {
   log "Нода перезапущена"
 }
 
-gen_inbounds() {
-  cat <<EOF
-{
-  "tag": "REALITY_SELFSTEAL",
-  "listen": "0.0.0.0",
-  "port": 443,
-  "protocol": "vless",
-  "settings": { "clients": [], "decryption": "none" },
-  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
-  "streamSettings": {
-    "network": "raw",
-    "security": "reality",
-    "realitySettings": {
-      "target": "${SOCK}",
-      "xver": 1,
-      "serverNames": ["${DOMAIN}"],
-      "privateKey": "СГЕНЕРИРУЙ_В_ПАНЕЛИ",
-      "shortIds": [""]
-    }
-  }
-},
-{
-  "tag": "XHTTP_NGINX",
-  "listen": "127.0.0.1",
-  "port": ${XHTTP_PORT},
-  "protocol": "vless",
-  "settings": { "clients": [], "decryption": "none" },
-  "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] },
-  "streamSettings": {
-    "network": "xhttp",
-    "security": "none",
-    "xhttpSettings": { "path": "${XHTTP_PATH}", "mode": "auto" }
-  }
-}
-EOF
-}
-
 finish() {
-  local sock_code tls_code="" s _
+  local code="" sock_code="" _
 
-  sock_code=$(sock_http_code)
-  # Нода только что перезапущена — дадим ей получить конфиг от панели и занять 443
-  if (( NODE_RECREATED )); then
-    log "Жду, пока нода получит конфиг от панели (до 30 секунд)…"
-    for _ in $(seq 1 15); do
-      [[ $(port_status 443) == node:* ]] && break
-      sleep 2
-    done
-  fi
-  # Если 443 у Xray — проверим весь путь: 443 → REALITY → сокет → nginx
-  if [[ $(port_status 443) == node:* ]]; then
-    for _ in $(seq 1 5); do
-      tls_code=$(tls_443_code)
-      [[ $tls_code == 200 ]] && break
-      sleep 2
-    done
-  fi
-
-  { echo "["; gen_inbounds; echo "]"; } >"$INBOUNDS_JSON"
-  hdr "Для панели Remnawave"
-  echo "1) В Config Profile этой ноды — два инбаунда (копия: $INBOUNDS_JSON):"
-  echo
-  gen_inbounds | sed 's/^/   /'
-  echo
-  echo "   privateKey и shortIds сгенерируй в панели. Если на 443 у ноды уже есть REALITY —"
-  echo "   поменяй в нём target на ${SOCK}, добавь \"xver\": 1 и ${DOMAIN} в serverNames."
-  echo "2) Включи оба инбаунда на ноде и добавь их во внутренний сквад."
-  echo "3) Хосты:"
-  echo "   REALITY: адрес ${DOMAIN}, порт 443, SNI ${DOMAIN}, fingerprint chrome"
-  echo "   XHTTP:   адрес ${DOMAIN}, порт 443, TLS, SNI ${DOMAIN}, XHTTP mode packet-up"
-  if (( ! NO_UFW )); then
-    echo "4) UFW:"
-    for s in "${UFW_SUMMARY[@]}"; do echo "   - $s"; done
-    echo "   Новый инбаунд на публичном порту — открой его: ufw allow <порт>"
-  fi
-
-  echo
-  if [[ $tls_code == 200 ]]; then
-    printf '%s✅ Всё готово!%s Сайт открывается через 443 (REALITY → nginx).\n' "$C_G" "$C_0"
-    echo "Открой в браузере https://$DOMAIN — там должна открыться заглушка."
-  elif [[ $sock_code == 200 ]]; then
-    printf '%s✅ nginx и сертификат готовы.%s\n' "$C_G" "$C_0"
-    echo "Осталось в панели: REALITY на 443 с target ${SOCK} и xver 1 (п. 1 выше)."
-    echo "После этого открой https://$DOMAIN — там должна открыться заглушка."
+  if [[ $MODE == egames ]]; then
+    sock_code=$(sock_http_code)
+    # Нода только что перезапущена — дадим ей получить конфиг от панели и занять 443
+    if (( NODE_RECREATED )); then
+      log "Жду, пока нода получит конфиг от панели (до 30 секунд)…"
+      for _ in $(seq 1 15); do
+        [[ $(port_status 443) == node:* ]] && break
+        sleep 2
+      done
+    fi
+    # Если 443 у Xray — проверим весь путь: 443 → REALITY → сокет → nginx
+    if [[ $(port_status 443) == node:* ]]; then
+      for _ in $(seq 1 5); do
+        code=$(tls_443_code)
+        [[ $code == 200 ]] && break
+        sleep 2
+      done
+    fi
   else
-    warn "Проверка через сокет вернула код '${sock_code:-нет ответа}' — что-то может быть не так."
-    echo "Открой https://$DOMAIN после настройки REALITY в панели (п. 1 выше)."
+    code=$(tls_443_code)
   fi
-  echo "Если заглушки нет или браузер ругается на сертификат — напиши в поддержку: $SUPPORT"
+
+  if (( ${#NODE_HOLDS[@]} )); then
+    echo
+    if (( NODE_BIND_FAIL )); then
+      warn "Xray на ноде НЕ запустился: порт ${NODE_HOLDS[*]} теперь у nginx."
+      warn "В панели перенеси инбаунд с ${NODE_HOLDS[*]} на другой порт (и открой его: ufw allow <порт>)"
+      warn "или назначь ноде профиль, где на ${NODE_HOLDS[*]} ничего нет. Пока это не сделано — нода offline."
+    else
+      warn "Порт ${NODE_HOLDS[*]} теперь у nginx. Если в профиле ноды остался инбаунд на ${NODE_HOLDS[*]} — перенеси его,"
+      warn "иначе Xray не запустится. Проверь в панели, что нода Online."
+    fi
+  fi
+
+  echo
+  if (( NODE_BIND_FAIL )); then
+    printf '%s⚠️  nginx и сертификат настроены, но нода сейчас offline — перенеси инбаунд с %s (см. выше).%s\n' \
+      "$C_Y" "${NODE_HOLDS[*]}" "$C_0"
+  elif [[ $code == 200 ]]; then
+    printf '%s✅ Всё успешно настроено!%s\n' "$C_G" "$C_0"
+    echo "Открой https://$DOMAIN — там должна открыться заглушка."
+  elif [[ $MODE == egames && $sock_code == 200 ]]; then
+    printf '%s✅ Всё успешно настроено!%s\n' "$C_G" "$C_0"
+    echo "Осталось настроить ноду в панели Remnawave — после этого https://$DOMAIN откроет заглушку."
+  else
+    warn "Проверка с сервера вернула код '${code:-${sock_code:-нет ответа}}' — что-то может быть не так."
+    echo "Открой https://$DOMAIN — там должна открыться заглушка."
+  fi
+  echo "Конфиги можно найти на сайте: $CONFIGS_URL"
+  echo "Если что-то не работает — напиши в поддержку: $SUPPORT"
 }
 
 main() {
   parse_args "$@"
   init_tty
-  hdr "Remnawave Node: nginx за REALITY + сертификат + XHTTP + UFW"
+  trap on_exit EXIT
+  hdr "Remnawave Node: nginx + сертификат + XHTTP + UFW"
   preflight
+  ask_mode
+  log "Режим: $(mode_title)"
   ask_domain
+  ask_xhttp_port
   ask_path
   ask_ufw
+  if [[ -n $NODE_PORT && $NODE_PORT == "$XHTTP_PORT" ]]; then
+    die "Порт XHTTP ($XHTTP_PORT) совпадает с портом ноды для панели — выбери другой"
+  fi
   install_deps
   check_dns
-  check_ports
+  if [[ $MODE == egames ]]; then check_ports_egames; else check_ports_docs; fi
 
   hdr "docker-compose.yml"
   compose_add_nginx
-  compose_node_shm
+  if [[ $MODE == egames ]]; then compose_node_shm; fi
 
   hdr "nginx: 80 порт"
   prepare_dirs
@@ -1182,7 +1382,11 @@ main() {
   if user_conf_has_domain; then
     SKIP_BLOCKS=1
     warn "В $NGINX_CONF уже есть твоя настройка для $DOMAIN — её не трогаю и свои блоки не добавляю."
-    warn "Проверь сам, что там есть listen unix:${SOCK} ssl proxy_protocol и XHTTP-location на 127.0.0.1:$XHTTP_PORT."
+    if [[ $MODE == egames ]]; then
+      warn "Проверь сам, что там есть listen unix:${SOCK} ssl proxy_protocol и XHTTP-location на 127.0.0.1:$XHTTP_PORT."
+    else
+      warn "Проверь сам, что там есть listen 443 ssl и XHTTP-location на 127.0.0.1:$XHTTP_PORT."
+    fi
     nginx_up 0
   elif append_block http gen_http_block; then
     nginx_up 1
@@ -1198,28 +1402,52 @@ main() {
   hdr "Сертификат"
   issue_cert
 
-  hdr "nginx: сокет ${SOCK}"
-  if (( ! SKIP_BLOCKS )); then
-    if remove_block https; then
-      log "Убрал старый блок 443 для $DOMAIN (прошлая версия скрипта) — теперь 443 у Xray"
-    fi
-    if has_default_sock; then ADD_DEFAULT=0; else ADD_DEFAULT=1; fi
-    if append_block sock gen_sock_block; then
-      nginx_up 1
-      log "Добавил блок сокета: сайт + XHTTP $XHTTP_PATH → 127.0.0.1:$XHTTP_PORT"
+  if [[ $MODE == egames ]]; then
+    hdr "nginx: сокет ${SOCK}"
+    if (( ! SKIP_BLOCKS )); then
+      if remove_block https; then
+        log "Убрал блок 443 для $DOMAIN (режим документации) — теперь 443 у Xray"
+      fi
+      if has_default_sock; then ADD_DEFAULT=0; else ADD_DEFAULT=1; fi
+      if append_block sock gen_sock_block; then
+        nginx_up 1
+        log "Добавил блок сокета: сайт + XHTTP $XHTTP_PATH/ → 127.0.0.1:$XHTTP_PORT"
+      else
+        nginx_up 0
+        log "Блок сокета для $DOMAIN уже есть в $NGINX_CONF"
+      fi
     else
       nginx_up 0
-      log "Блок сокета для $DOMAIN уже есть в $NGINX_CONF"
+    fi
+    if grep -Fq "unix:${SOCK}" "$NGINX_CONF"; then
+      wait_sock
+    else
+      warn "В $NGINX_CONF нет listen unix:${SOCK} — Xray не сможет отдавать трафик в nginx."
+    fi
+    local l443
+    l443=$(conf_443_lines)
+    if [[ -n $l443 ]]; then
+      warn "В $NGINX_CONF остались listen 443 (строки $l443) — nginx займёт 443 и Xray не сможет на нём слушать."
+      warn "Убери эти listen или переведи их на unix:${SOCK} ssl proxy_protocol."
     fi
   else
-    nginx_up 0
-  fi
-  wait_sock
-  local l443
-  l443=$(conf_443_lines)
-  if [[ -n $l443 ]]; then
-    warn "В $NGINX_CONF остались listen 443 (строки $l443) — nginx займёт 443 и Xray не сможет на нём слушать."
-    warn "Убери эти listen или переведи их на unix:${SOCK} ssl proxy_protocol."
+    hdr "nginx: 443 порт"
+    if (( ! SKIP_BLOCKS )); then
+      if remove_block sock; then
+        log "Убрал блок сокета для $DOMAIN (режим eGames) — теперь nginx слушает 443"
+      fi
+      if has_default_443; then ADD_DEFAULT=0; else ADD_DEFAULT=1; fi
+      if append_block https gen_https_block; then
+        nginx_up 1
+        log "Добавил блок 443 порта: сайт + XHTTP $XHTTP_PATH/ → 127.0.0.1:$XHTTP_PORT"
+      else
+        nginx_up 0
+        log "Блок 443 порта для $DOMAIN уже есть в $NGINX_CONF"
+      fi
+    else
+      nginx_up 0
+    fi
+    if conf_listens 443; then wait_443; fi
   fi
 
   hdr "Автопродление"
@@ -1228,9 +1456,13 @@ main() {
   hdr "Заглушка"
   make_index
 
-  if (( NODE_NEEDS_SHM || NODE_KICK )); then
+  if [[ $MODE == egames ]] && (( NODE_NEEDS_SHM || NODE_KICK )); then
     hdr "Нода"
     recreate_node
+  elif (( ${#NODE_STOPPED[@]} )); then
+    hdr "Нода"
+    start_node
+    check_node_after_start
   fi
 
   finish
